@@ -19,7 +19,6 @@
 .vscode/
 *.swp
 *~
-.pansou_build_tree.py
 
 # Local environment and secrets
 .env
