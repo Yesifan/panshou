@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: pansou-linux-x86_64
+            builder: cross
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: pansou-linux-aarch64
+            builder: cross
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: pansou-macos-x86_64
+            builder: cargo
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: pansou-macos-aarch64
+            builder: cargo
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: pansou-windows-x86_64
+            builder: cargo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@cross
+      - name: Build with cross
+        if: matrix.builder == 'cross'
+        run: cross build --release --locked --target ${{ matrix.target }}
+      - name: Build with Cargo
+        if: matrix.builder == 'cargo'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/pansou" dist/pansou
+          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" pansou
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/pansou.exe" "dist/pansou.exe"
+          Compress-Archive -Path "dist/pansou.exe" -DestinationPath "${{ matrix.artifact }}.zip"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  checksums:
+    name: Generate checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create SHA256SUMS
+        working-directory: dist
+        run: sha256sum pansou-*.tar.gz pansou-*.zip > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pansou-checksums
+          path: dist/SHA256SUMS
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: checksums
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/pansou-linux-x86_64.tar.gz
+            dist/pansou-linux-aarch64.tar.gz
+            dist/pansou-macos-x86_64.tar.gz
+            dist/pansou-macos-aarch64.tar.gz
+            dist/pansou-windows-x86_64.zip
+            dist/SHA256SUMS

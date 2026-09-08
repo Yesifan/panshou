@@ -1,0 +1,7 @@
+event: message
+data: {"title":"仙逆 第一季","name":"仙逆 第一季","url":"token-one","disk_type":"quark","is_type":0}
+
+event: message
+data: {"title":"仙逆 第二季","name":"仙逆 第二季","url":"token-two","disk_type":"aliyun","is_type":1}
+
+data: [DONE]

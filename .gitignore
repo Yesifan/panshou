@@ -1,0 +1,27 @@
+# Rust build output
+/target/
+
+# Local reference implementation
+/refer/
+
+# Test and coverage output
+/coverage/
+/tarpaulin-report.html
+/*.profraw
+/*.profdata
+/junit.xml
+
+# Temporary and local files
+*.tmp
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+.pansou_build_tree.py
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example

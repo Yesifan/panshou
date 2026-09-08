@@ -1,0 +1,19 @@
+{
+  "ok": 1,
+  "data": {
+    "list": [
+      {
+        "idstr": "501234567890",
+        "created_at": "Mon Sep 07 12:30:00 +0800 2026",
+        "text_raw": "<b>仙逆 最新</b> https://pan.quark.cn/s/Quark123",
+        "url_struct": []
+      },
+      {
+        "id": 501234567891,
+        "created_at": "Mon Sep 07 13:30:00 +0800 2026",
+        "text": "评论区见",
+        "url_struct": [{"url_title": "网页链接", "long_url": "https://pan.baidu.com/s/Baidu123?pwd=a1b2"}]
+      }
+    ]
+  }
+}

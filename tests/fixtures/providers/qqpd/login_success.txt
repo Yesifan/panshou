@@ -1,0 +1,1 @@
+ptuiCB('0','0','https://ptlogin2.pd.qq.com/check_sig?uin=123456789&ptsigx=abcXYZ123','0','登录成功！','Tester');

@@ -1,0 +1,20 @@
+{
+  "data": {
+    "union_result": {
+      "guild_feeds": [
+        {
+          "feed_id": "feed-1",
+          "title": "名称：仙逆 最新合集\n额外信息",
+          "content": "夸克：https://pan.quark.cn/s/Quark123 提取码：a1b2",
+          "create_time": "1788753600",
+          "images": [{"url": "https://img.test/a.jpg"}]
+        },
+        {
+          "feed_id": "empty",
+          "title": "无链接",
+          "content": "nothing here"
+        }
+      ]
+    }
+  }
+}
