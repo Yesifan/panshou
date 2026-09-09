@@ -1,7 +1,8 @@
 # PanSou Rust CLI 整体架构
 
 本文说明 PanSou Rust CLI v1 的运行时结构、模块边界和扩展方式。实现以
-`src/**` 为准，产品范围及兼容目标见 [RUST_CLI_V1_SPEC.md](RUST_CLI_V1_SPEC.md)。
+`src/**` 为准，产品范围及兼容目标见
+[RUST_CLI_V1_SPEC.md](specs/RUST_CLI_V1_SPEC.md)。
 
 ## 1. 设计目标
 
