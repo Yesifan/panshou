@@ -7,8 +7,15 @@ PanSou 是一个以 Rust 编写的本地网盘资源搜索与链接检测工具�
 ## 安装
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
+curl -fsSL \
   https://raw.githubusercontent.com/Yesifan/panshou/main/scripts/install.sh | sh
+```
+
+## 卸载
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/Yesifan/panshou/main/scripts/uninstall.sh | sh
 ```
 
 ## 使用

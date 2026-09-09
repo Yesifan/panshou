@@ -3,28 +3,23 @@
 ## Project Structure & Module Organization
 
 ```text
-PanSou/
-├── src/
-│   ├── main.rs          # CLI 可执行程序入口
-│   ├── lib.rs           # 对外暴露可复用模块
-│   ├── core/            # 核心领域逻辑
-│   ├── search/          # 搜索编排
-│   ├── providers/       # 站点适配器
-│   ├── check/           # 链接校验
-│   ├── http/            # 网络传输
-│   ├── config/          # 配置管理
-│   ├── state/           # 状态管理
-│   ├── cli/             # CLI 参数解析
-│   └── output/          # 输出与渲染
-├── tests/
-│   └── fixtures/        # 集成测试与测试数据
-├── docs/                # 项目文档
-├── .github/workflows/   # CI / 发布自动化
-└── scripts/
-    └── install.sh       # 安装脚本
+src/
+├── main.rs        # CLI 入口
+├── lib.rs         # 公共模块
+├── core/          # 领域逻辑
+├── search/        # 搜索编排
+├── providers/     # 站点适配
+├── check/         # 链接校验
+├── http|config|state/  # 传输、配置、状态
+└── cli|output/    # CLI 与输出
+
+tests/             # 集成测试与 fixtures
+docs/              # 文档
+.github/workflows/ # 发布自动化
+scripts/           # 安装与卸载脚本
 ```
 
-部分有状态的 Provider 测试 fixture 会直接放在对应模块旁。[架构文档](./docs/architecture.md) 介绍了模块间的依赖关系和数据流。
+部分有状态的 Provider 测试 fixture 会直接放在对应模块旁。
 
 ## Build, Test, and Development Commands
 

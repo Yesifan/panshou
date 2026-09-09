@@ -4,7 +4,12 @@ set -eu
 
 REPOSITORY="${PANSOU_REPOSITORY:-Yesifan/panshou}"
 VERSION="${PANSOU_VERSION:-latest}"
-INSTALL_DIR="${PANSOU_INSTALL_DIR:-}"
+INSTALL_DIR=
+INSTALL_DIR_EXPLICIT=0
+if [ -n "${PANSOU_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR=$PANSOU_INSTALL_DIR
+    INSTALL_DIR_EXPLICIT=1
+fi
 
 usage() {
     cat <<'EOF'
@@ -14,8 +19,8 @@ Usage: install.sh [--version VERSION] [--dir DIRECTORY]
 
 Options:
   --version VERSION  Release to install, for example v0.1.0 (default: latest)
-  --dir DIRECTORY    Installation directory (default: /usr/local/bin when
-                     writable, otherwise $HOME/.local/bin)
+  --dir DIRECTORY    Installation directory; skips automatic PATH detection
+                     (default: $HOME/.local/bin, then /usr/local/bin, if in PATH)
   -h, --help         Show this help
 
 Environment variables:
@@ -38,7 +43,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --dir)
             [ "$#" -ge 2 ] || fail "--dir requires a value"
+            [ -n "$2" ] || fail "--dir requires a non-empty value"
             INSTALL_DIR=$2
+            INSTALL_DIR_EXPLICIT=1
             shift 2
             ;;
         -h|--help)
@@ -89,12 +96,21 @@ else
     fail "sha256sum or shasum is required"
 fi
 
-if [ -z "$INSTALL_DIR" ]; then
-    if [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+path_contains() {
+    case ":${PATH:-}:" in
+        *:"$1":*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ "$INSTALL_DIR_EXPLICIT" -eq 0 ]; then
+    if [ -n "${HOME:-}" ] && path_contains "$HOME/.local/bin"; then
+        INSTALL_DIR="$HOME/.local/bin"
+    elif path_contains /usr/local/bin; then
         INSTALL_DIR=/usr/local/bin
     else
-        : "${HOME:?HOME is required when /usr/local/bin is not writable}"
-        INSTALL_DIR="$HOME/.local/bin"
+        fail "neither \$HOME/.local/bin nor /usr/local/bin is in PATH
+add one of them to PATH, or specify a directory with --dir or PANSOU_INSTALL_DIR"
     fi
 fi
 
@@ -107,7 +123,7 @@ esac
 ASSET="pansou-$OS-$ARCH.tar.gz"
 BASE_URL="https://github.com/$REPOSITORY/releases/$RELEASE_PATH"
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pansou-install.XXXXXX")
-trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
+trap 'rm -rf "$TMP_DIR"' 0 HUP INT TERM
 
 printf 'Downloading %s...\n' "$ASSET"
 download "$BASE_URL/$ASSET" "$TMP_DIR/$ASSET"
@@ -131,7 +147,3 @@ else
 fi
 
 printf 'Installed PanSou to %s\n' "$DESTINATION"
-case ":$PATH:" in
-    *:"$INSTALL_DIR":*) ;;
-    *) printf 'Add %s to PATH to run pansou from any directory.\n' "$INSTALL_DIR" ;;
-esac

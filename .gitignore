@@ -12,6 +12,7 @@
 /junit.xml
 
 # Temporary and local files
+.installer-test-bin/
 *.tmp
 *.log
 .DS_Store
