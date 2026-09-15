@@ -59,6 +59,15 @@ pansou update
 - [开发指南](docs/development.md)
 - [整体架构](docs/architecture.md)
 
+## 致谢
+
+本项目是对 [fish2018/pansou](https://github.com/fish2018/pansou) 的 Rust CLI
+重构。Provider 协议、解析行为及部分内置频道数据参考了上游实现。
+
+感谢原项目作者及所有贡献者的工作。
+
+本项目为独立维护的 CLI 实现，与上游项目存在产品形态和实现差异。
+
 ## License
 
 MIT
