@@ -154,12 +154,9 @@ pub struct SearchArgs {
     pub proxy: Option<String>,
     #[arg(long, value_parser = parse_search_format, default_value = "table", help = "Streaming output: table or jsonl")]
     pub format: OutputFormat,
-    /// Check discovered links for availability.
+    /// Skip link validation and show all unchecked results.
     #[arg(long)]
-    pub check: bool,
-    /// Check links and show only valid results.
-    #[arg(long)]
-    pub valid_only: bool,
+    pub no_check: bool,
     /// Show detailed progress and diagnostics.
     #[arg(long, conflicts_with = "quiet")]
     pub verbose: bool,
@@ -632,7 +629,7 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
         timeout,
         all_timeout: Duration::from_secs(config.search.all_timeout_secs),
     };
-    let checker = if args.check || args.valid_only {
+    let checker = if !args.no_check {
         let cache = if config.check.enabled_cache {
             paths.ensure_dirs()?;
             Some(CheckCache::open(&paths.check_cache)?)
@@ -655,7 +652,7 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
             proxy_scope: proxy.as_deref().map(proxy_scope),
         },
         args.format,
-        args.valid_only,
+        !args.no_check,
         args.quiet,
     )
     .await

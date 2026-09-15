@@ -59,11 +59,30 @@ fn parses_search_contract_and_repeatable_filters() {
 }
 
 #[test]
-fn valid_only_and_check_stdin_parse() {
-    let search = Cli::try_parse_from(["pansou", "search", "仙逆", "--valid-only"]).unwrap();
-    assert!(matches!(search.command, Command::Search(args) if args.valid_only));
+fn check_stdin_parses() {
     let check = Cli::try_parse_from(["pansou", "check", "--stdin", "--fail-invalid"]).unwrap();
     assert!(matches!(check.command, Command::Check(args) if args.stdin && args.fail_invalid));
+}
+
+#[test]
+fn search_checks_by_default_and_no_check_disables_it() {
+    let default = Cli::try_parse_from(["pansou", "search", "仙逆"]).unwrap();
+    assert!(matches!(default.command, Command::Search(args) if !args.no_check));
+
+    let unchecked = Cli::try_parse_from(["pansou", "search", "仙逆", "--no-check"]).unwrap();
+    assert!(matches!(unchecked.command, Command::Search(args) if args.no_check));
+
+    for removed in ["--check", "--valid-only"] {
+        assert!(Cli::try_parse_from(["pansou", "search", "仙逆", removed]).is_err());
+    }
+}
+
+#[test]
+fn search_help_describes_no_check() {
+    let error = Cli::try_parse_from(["pansou", "search", "--help"]).unwrap_err();
+    let help = error.to_string();
+    assert!(help.contains("--no-check"));
+    assert!(help.contains("show all unchecked results"));
 }
 
 #[test]

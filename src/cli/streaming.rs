@@ -24,7 +24,7 @@ pub(super) async fn run(
     checker: Option<Arc<CheckEngine>>,
     check_options: CheckOptions,
     format: OutputFormat,
-    valid_only: bool,
+    require_ok: bool,
     quiet: bool,
 ) -> anyhow::Result<i32> {
     drive(
@@ -33,7 +33,7 @@ pub(super) async fn run(
         checker,
         check_options,
         format,
-        valid_only,
+        require_ok,
         quiet,
         stdout(),
         tokio::signal::ctrl_c(),
@@ -52,7 +52,7 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
     checker: Option<Arc<CheckEngine>>,
     check_options: CheckOptions,
     format: OutputFormat,
-    valid_only: bool,
+    require_ok: bool,
     quiet: bool,
     mut writer: W,
     interrupt: F,
@@ -108,11 +108,11 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
                         if interrupted { continue; }
                         latest.insert(id.clone(), link.clone());
                         if checker.is_none() {
-                            emit_link(&mut writer, &mut emitted, id, link, format, valid_only)?;
+                            emit_link(&mut writer, &mut emitted, id, link, format, require_ok)?;
                         } else {
                             let key = check_key(&link);
                             if let Some(result) = checked.get(&key) {
-                                emit_link(&mut writer, &mut emitted, id, attach_check(link, result), format, valid_only)?;
+                                emit_link(&mut writer, &mut emitted, id, attach_check(link, result), format, require_ok)?;
                             } else if scheduled.insert(key.clone()) {
                                 let mut item = CheckItem::detect(link.url);
                                 item.password = link.password;
@@ -132,7 +132,7 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
             }
             Some((id, key, result)) = checks.next(), if !checks.is_empty() => {
                 if let Some(link) = latest.get(&id).filter(|link| check_key(link) == key) {
-                    emit_link(&mut writer, &mut emitted, id, attach_check(link.clone(), &result), format, valid_only)?;
+                    emit_link(&mut writer, &mut emitted, id, attach_check(link.clone(), &result), format, require_ok)?;
                 }
                 checked.insert(key, result);
             }
@@ -187,9 +187,9 @@ fn emit_link<W: Write>(
     id: String,
     link: MergedLink,
     format: OutputFormat,
-    valid_only: bool,
+    require_ok: bool,
 ) -> anyhow::Result<()> {
-    if valid_only
+    if require_ok
         && !link
             .check
             .as_ref()
@@ -214,7 +214,7 @@ mod tests {
     use super::*;
     use crate::{
         check::{CheckCloudType, CheckContext, CheckError, CheckEvaluation, LinkChecker},
-        core::{Link, ProviderError, SearchResult},
+        core::{Link, MergedLink, ProviderError, SearchResult, Source},
         providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext},
     };
     use async_trait::async_trait;
@@ -309,6 +309,89 @@ mod tests {
                 ..SearchOptions::default()
             },
         )
+    }
+
+    fn checked_link(state: crate::core::CheckState) -> MergedLink {
+        MergedLink {
+            cloud_type: crate::core::CloudType::Quark,
+            url: "https://pan.quark.cn/s/abc123".into(),
+            password: None,
+            note: "fixture".into(),
+            datetime: None,
+            source: Source::provider("fixture"),
+            images: Vec::new(),
+            check: Some(crate::core::CheckResult {
+                state,
+                cache_hit: false,
+                checked_at: None,
+                expires_at: None,
+                summary: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn require_ok_emits_ok_and_filters_every_other_check_state() {
+        let mut emitted = HashMap::new();
+        let mut output = Vec::new();
+        emit_link(
+            &mut output,
+            &mut emitted,
+            "ok".into(),
+            checked_link(crate::core::CheckState::Ok),
+            OutputFormat::Jsonl,
+            true,
+        )
+        .unwrap();
+        assert_eq!(emitted.len(), 1);
+
+        for state in [
+            crate::core::CheckState::Bad,
+            crate::core::CheckState::Locked,
+            crate::core::CheckState::Uncertain,
+            crate::core::CheckState::Unsupported,
+        ] {
+            emit_link(
+                &mut output,
+                &mut emitted,
+                format!("{state:?}"),
+                checked_link(state),
+                OutputFormat::Jsonl,
+                true,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .filter(|line| !line.is_empty())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unchecked_mode_emits_results_without_check_metadata() {
+        let mut link = checked_link(crate::core::CheckState::Bad);
+        link.check = None;
+        let mut emitted = HashMap::new();
+        let mut output = Vec::new();
+        emit_link(
+            &mut output,
+            &mut emitted,
+            "unchecked".into(),
+            link,
+            OutputFormat::Jsonl,
+            false,
+        )
+        .unwrap();
+
+        let event: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(event["event"], "result");
+        assert!(event["link"].get("check").is_none());
     }
 
     #[tokio::test(start_paused = true)]

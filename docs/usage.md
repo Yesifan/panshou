@@ -15,8 +15,7 @@ pansou search <QUERY>
   --all-timeout <SECONDS>
   --proxy <URL>
   --format <table|jsonl>
-  --check
-  --valid-only
+  --no-check
   --verbose
   --quiet
 ```
@@ -36,9 +35,9 @@ pansou search "仙逆" --source provider \
 pansou search "仙逆" --include 4K --exclude 预告 \
   --jobs 4 --timeout 20 --all-timeout 600
 
-# 搜索后检测链接；valid-only 会隐式启用检测，只保留 ok
-pansou search "仙逆" --check --format jsonl
-pansou search "仙逆" --valid-only --format jsonl
+# 默认检测链接并只输出 ok；可显式关闭检测并显示全部结果
+pansou search "仙逆" --format jsonl
+pansou search "仙逆" --no-check --format jsonl
 ```
 
 默认搜索独立频道清单中启用的 Telegram 频道、15 个无登录 provider，以及已经配置且登录有效的
@@ -72,7 +71,9 @@ TG 每频道只请求一次公开搜索页，不翻页、不自动重试；解�
 
 搜索不再支持 `--format json`；独立 `check` 命令仍支持 JSON。
 进度和诊断写入 stderr，结果事件写入 stdout；`--quiet` 隐藏普通进度但保留数据及摘要。
-`--check` 在每条链接检测完成后输出，`--valid-only` 只输出有效链接。
+搜索默认在每条链接检测完成后、仅当状态为 `ok` 时输出。`bad`、
+`locked`、`uncertain` 和 `unsupported` 均会被过滤。`--no-check` 跳过检测并输出
+全部搜索结果。
 搜索总时限结束后，已接收链接的检测仍可继续，因此命令总耗时可能超过 `--all-timeout`。
 
 `pansou help` 根据本地配置显示来源数、并发和搜索阶段保守等待估算：

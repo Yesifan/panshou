@@ -56,8 +56,8 @@ SearchEngine -> core merge/filter/rank -> optional CheckEngine -> output
 
 CLI 是应用编排边界，提供以下命令：
 
-- `search`：解析来源、provider、频道、过滤条件、并发数、超时、代理、输出格式以及
-  `--check`/`--valid-only`。
+- `search`：解析来源、provider、频道、过滤条件、并发数、超时、代理和输出格式；
+  默认检测链接并仅输出 `ok`，`--no-check` 可关闭检测。
 - `check`：接收参数或 stdin 中的链接，调用检测引擎。
 - `provider`：列举 provider/profile，并执行登录、退出、状态查询和配置。
 - `config`：显示合并后的配置或配置文件路径。
@@ -144,8 +144,9 @@ profile 数据和搜索实现分开组织。
 - `unsupported`：当前类型无 checker。
 - `uncertain`：网络、超时或协议信息不足，无法确定。
 
-Redb 仅作为 check cache 使用。不同状态有不同 TTL；`--refresh` 跳过读取但更新缓存，
-`--no-cache` 同时禁止读取和写入。搜索不会进入这套缓存。
+Redb 仅作为 check cache 使用。不同状态有不同 TTL；独立 `check` 命令的
+`--refresh` 跳过读取但更新缓存，`--no-cache` 同时禁止读取和写入。默认搜索检测
+也使用这套缓存；`search --no-check` 不读写 check cache。
 
 ### 3.6 HTTP (`src/http`)
 

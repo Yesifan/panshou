@@ -262,8 +262,7 @@ pansou search <QUERY>
 
   --format <table|json|jsonl>
 
-  --check
-  --valid-only
+  --no-check
 
   --verbose
   --quiet
@@ -378,10 +377,10 @@ table 只是一个 view。
 pansou check URL
 ```
 
-以及：
+搜索默认在 CLI 层接入检测：
 
 ```bash
-pansou search "仙逆" --check
+pansou search "仙逆"
 ```
 
 但两者必须保持模块解耦。
@@ -393,25 +392,25 @@ search
   ↓
 MergedLink[]
   ↓
-如果 CLI 指定 --check
-  ↓
+如果 CLI 未指定 --no-check
+↓
 调用 CheckEngine
-  ↓
+↓
 附加 CheckState
 ```
 
 不要让 `Provider` 依赖 `LinkChecker`。
 
-`--valid-only`：
+`默认输出`：
 
 ```text
-隐式启用 --check
-
 最终只输出：
 state == ok
 ```
 
 `locked` 不算 valid。
+
+`--no-check` 跳过 CheckEngine 并输出全部未校验结果。
 
 ---
 
@@ -2728,7 +2727,7 @@ pansou check
 再在 CLI 层接：
 
 ```text
-pansou search --check
+pansou search
 ```
 
 ---
@@ -2821,8 +2820,8 @@ exit code
 --quiet
 --verbose
 
-search --check
-search --valid-only
+search 默认检测并过滤
+search --no-check
 
 config show
 config path
@@ -3225,9 +3224,9 @@ CLI:
 
 [ ] timeout
 
-[ ] search --check
+[ ] search 默认检测并过滤
 
-[ ] search --valid-only
+[ ] search --no-check
 
 [ ] check
 
