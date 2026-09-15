@@ -41,7 +41,7 @@ pub const EXIT_INVALID_LINK: i32 = 10;
 pub const EXIT_DEADLINE: i32 = 124;
 pub const EXIT_INTERRUPTED: i32 = 130;
 
-const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources. Use short, focused keywords; longer queries may reduce search quality.\nResults stream as sources finish. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
+const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources. Use short, focused keywords; longer queries may reduce search quality.\nInteractive terminals show progress on stderr; final results are written to stdout. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -84,7 +84,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Search Telegram channels and providers, streaming results as they arrive.
+    /// Search Telegram channels and providers, then print merged results.
     Search(SearchArgs),
     /// Validate cloud-drive links and report their availability.
     Check(CheckArgs),
@@ -153,11 +153,14 @@ pub struct SearchArgs {
     /// Override the configured proxy URL.
     #[arg(long)]
     pub proxy: Option<String>,
-    #[arg(long, value_parser = parse_search_format, default_value = "table", help = "Streaming output: table or jsonl")]
+    #[arg(long, value_parser = parse_search_format, default_value = "table", help = "Final output: table or json")]
     pub format: OutputFormat,
     /// Skip link validation and show all unchecked results.
     #[arg(long)]
     pub no_check: bool,
+    /// Hide the interactive search and link-check progress bars.
+    #[arg(long)]
+    pub no_progress: bool,
     /// Show detailed progress and diagnostics.
     #[arg(long, conflicts_with = "quiet")]
     pub verbose: bool,
@@ -406,9 +409,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
 fn parse_search_format(value: &str) -> Result<OutputFormat, String> {
     match value {
         "table" => Ok(OutputFormat::Table),
-        "jsonl" => Ok(OutputFormat::Jsonl),
-        "json" => Err("search JSON output was removed; use --format jsonl".into()),
-        _ => Err("expected table or jsonl".into()),
+        "json" => Ok(OutputFormat::Json),
+        "jsonl" => Err("search JSONL output was removed; use --format json".into()),
+        _ => Err("expected table or json".into()),
     }
 }
 
@@ -485,7 +488,7 @@ fn search_defaults_text(
     let seconds = (providers + channels).div_ceil(jobs.max(1)) as u64;
     let seconds = seconds.saturating_mul(timeout).min(all_timeout);
     format!(
-        "Current search defaults:\n  Providers: {providers}\n  Enabled channels: {channels}/{}\n  Concurrency: {jobs}\n  Timeout per source: {timeout}s\n  Overall search timeout: {all_timeout}s\n  Estimated maximum search wait: ~{seconds}s (~{:.1}m)\nResults stream as sources finish. Initialization and link checking may take additional time.",
+        "Current search defaults:\n  Providers: {providers}\n  Enabled channels: {channels}/{}\n  Concurrency: {jobs}\n  Timeout per source: {timeout}s\n  Overall search timeout: {all_timeout}s\n  Estimated maximum search wait: ~{seconds}s (~{:.1}m)\nInteractive terminals show progress; final output appears after merging and link checking.",
         crate::channel::MAX_ENABLED_CHANNELS,
         seconds as f64 / 60.0
     )
@@ -650,18 +653,6 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
     if providers.is_empty() && channels.is_empty() {
         return Err(usage("no search sources selected"));
     }
-    if !args.quiet {
-        eprintln!(
-            "{}",
-            search_defaults_text(
-                providers.len(),
-                channels.len(),
-                config.search.jobs,
-                timeout.as_secs(),
-                config.search.all_timeout_secs
-            )
-        );
-    }
     let context = SearchContext::new(http.clone(), timeout);
     let engine = SearchEngine::new(context);
     let options = SearchOptions {
@@ -699,7 +690,8 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
         },
         args.format,
         !args.no_check,
-        args.quiet,
+        args.verbose,
+        args.no_progress || args.quiet,
         crate::channel::ChannelStore::new(paths.channels_file.clone()),
     )
     .await

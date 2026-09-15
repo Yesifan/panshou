@@ -14,8 +14,9 @@ pansou search <QUERY>
   --timeout <SECONDS>
   --all-timeout <SECONDS>
   --proxy <URL>
-  --format <table|jsonl>
+  --format <table|json>
   --no-check
+  --no-progress
   --verbose
   --quiet
 ```
@@ -36,8 +37,8 @@ pansou search "仙逆" --include 4K --exclude 预告 \
   --jobs 4 --timeout 20 --all-timeout 600
 
 # 默认检测链接并只输出 ok；可显式关闭检测并显示全部结果
-pansou search "仙逆" --format jsonl
-pansou search "仙逆" --no-check --format jsonl
+pansou search "仙逆" --format json
+pansou search "仙逆" --no-check --format json
 ```
 
 默认搜索独立频道清单中启用的 Telegram 频道、15 个无登录 provider，以及已经配置且登录有效的
@@ -50,30 +51,21 @@ pansou search "仙逆" --no-check --format jsonl
 TG 每频道只请求一次公开搜索页，不翻页、不自动重试；解析正文和按钮中的资源链接，
 正文命中完整关键词时保留该消息的链接。不提供中文自动分词或模糊搜索。
 
-### 流式输出
+### 进度与最终输出
 
-默认输出追加式表格，每个来源完成后立即输出其新增链接，无需 `--stream`。
-同一规范化 URL 只首次输出一次；后续密码等元数据变化追加 `UPDATE` 记录。
-批次内部排序，跨来源按完成顺序输出，不保证最终全局排名。
+交互式终端默认在 stderr 显示动态进度条，分别反映来源搜索和链接检测进度；
+`--no-progress` 可隐藏进度条。stderr 不是 TTY 时自动隐藏进度条；进度始终不写入 stdout，
+不会污染重定向或管道中的机器可读结果。诊断信息仍写入 stderr；`--quiet` 同时隐藏进度并
+压低非必要日志。
 
-`--format jsonl` 每行一个事件，使用 `event` 区分：
+所有来源结束且链接检测完成后，stdout 一次性输出最终结果。默认 `table` 按稳定顺序展示
+去重后的链接，并在末尾总结有效链接/候选链接数、来源完成/失败/取消/未开始数量和耗时。
+`--format json` 输出单个格式化 JSON 文档，包含最终链接、来源错误、搜索摘要及检测摘要，
+适合脚本读取。搜索和独立 `check` 命令均只支持 `table` 与 `json`。
 
-| 事件 | 含义 |
-| --- | --- |
-| `result` | 新链接，包含稳定 `id` 和 `link` |
-| `result_update` | 同一 `id` 的完整更新后 `link` |
-| `source_error` | 来源失败，包含 `error` |
-| `summary` | 最终统计，包含 `summary` |
-
-调用方应按 `id` 更新链接，不能把事件行数当作结果数量。摘要包含唯一链接数量、来源完成/
-失败/取消/未开始数量、`partial`、`finish_reason`、搜索阶段和整体耗时。
-`partial=true` 表示至少一个选定来源未成功完成；完整搜索没有结果仍是 `partial=false`。
-
-搜索不再支持 `--format json`；独立 `check` 命令仍支持 JSON。
-进度和诊断写入 stderr，结果事件写入 stdout；`--quiet` 隐藏普通进度但保留数据及摘要。
-搜索默认在每条链接检测完成后、仅当状态为 `ok` 时输出。`bad`、
+搜索默认只在链接检测状态为 `ok` 时保留。`bad`、
 `locked`、`uncertain` 和 `unsupported` 均会被过滤。`--no-check` 跳过检测并输出
-全部搜索结果。
+全部搜索结果，末尾摘要标记为 `unchecked`。
 搜索总时限结束后，已接收链接的检测仍可继续，因此命令总耗时可能超过 `--all-timeout`。
 
 `pansou help` 根据本地配置显示来源数、并发和搜索阶段保守等待估算：
@@ -158,7 +150,7 @@ pansou update --version v0.2.0 # 指定 Release 版本
 
 新版按数据格式版本检查迁移，确定性的格式变更在备份后转换；手动替换二进制升级也会检查。
 需要用户操作的事项会给出具体提示，未解决时在相关命令中继续提醒。本次旧频道字段不自动转换。
-搜索脚本需要从 JSON 改用 JSONL，并处理新增的事件格式和增量更新。
+使用 JSONL 的脚本需要改用单个 JSON 文档。
 
 若程序已更新但迁移失败，命令会明确报告，保留数据和备份。数据格式变化后不能仅恢复旧程序
 就假定完成回滚；应先确认旧版的数据兼容性。`help`、版本显示和 `update` 可用于修复配置问题。
@@ -196,7 +188,7 @@ pansou check [URL]...
   --proxy <URL>
   --refresh
   --no-cache
-  --format <table|json|jsonl>
+  --format <table|json>
   --fail-invalid
 ```
 

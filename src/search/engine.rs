@@ -143,8 +143,8 @@ impl SearchEngine {
         options: SearchOptions,
         sender: mpsc::UnboundedSender<SearchEvent>,
         cancellation: watch::Receiver<bool>,
-    ) -> SearchSummary {
-        self.run(options, Some(sender), cancellation).await.1
+    ) -> (SearchOutcome, SearchSummary) {
+        self.run(options, Some(sender), cancellation).await
     }
 
     pub async fn search(&self, options: SearchOptions) -> SearchOutcome {
@@ -652,7 +652,7 @@ mod tests {
                 updates += 1;
             }
         }
-        let summary = handle.await.unwrap();
+        let (_, summary) = handle.await.unwrap();
         assert_eq!(updates, 1);
         assert_eq!(summary.total_links, 1);
         assert_eq!(summary.sources_completed, 2);
@@ -666,7 +666,7 @@ mod tests {
         let active = first.active.clone();
         let (tx, _rx) = mpsc::unbounded_channel();
         let (_cancel, cancelled) = watch::channel(false);
-        let summary = test_engine()
+        let (_, summary) = test_engine()
             .search_stream(
                 SearchOptions {
                     providers: vec![Arc::new(first), Arc::new(timed("second", 100))],
@@ -701,7 +701,7 @@ mod tests {
             .collect();
         let (tx, _rx) = mpsc::unbounded_channel();
         let (_cancel, cancelled) = watch::channel(false);
-        let summary = test_engine()
+        let (_, summary) = test_engine()
             .search_stream(
                 SearchOptions {
                     providers,
@@ -735,7 +735,7 @@ mod tests {
         });
         assert!(matches!(rx.recv().await, Some(SearchEvent::Result { .. })));
         cancel.send(true).unwrap();
-        let summary = handle.await.unwrap();
+        let (_, summary) = handle.await.unwrap();
         assert_eq!(summary.finish_reason, FinishReason::Interrupted);
         assert_eq!(summary.total_links, 1);
         assert_eq!(summary.sources_completed, 1);
@@ -746,7 +746,7 @@ mod tests {
     async fn source_timeout_releases_slot_and_keeps_searching() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_cancel, cancelled) = watch::channel(false);
-        let summary = test_engine()
+        let (_, summary) = test_engine()
             .search_stream(
                 SearchOptions {
                     providers: vec![Arc::new(timed("slow", 100)), Arc::new(timed("fast", 1))],

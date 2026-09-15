@@ -42,7 +42,8 @@ fn parses_search_contract_and_repeatable_filters() {
         "--exclude",
         "枪版",
         "--format",
-        "jsonl",
+        "json",
+        "--no-progress",
         "--jobs",
         "4",
         "--timeout",
@@ -55,7 +56,8 @@ fn parses_search_contract_and_repeatable_filters() {
     assert_eq!(args.source, SourceSelection::Provider);
     assert_eq!(args.providers, ["meitizy", "cyg"]);
     assert_eq!(args.clouds[0].to_string(), "quark");
-    assert_eq!(args.format, OutputFormat::Jsonl);
+    assert_eq!(args.format, OutputFormat::Json);
+    assert!(args.no_progress);
     assert_eq!(args.jobs, Some(4));
 }
 
@@ -168,10 +170,14 @@ fn verbose_and_quiet_conflict() {
 }
 
 #[test]
-fn search_json_is_removed_but_check_json_remains() {
-    let error = Cli::try_parse_from(["pansou", "search", "仙逆", "--format", "json"]).unwrap_err();
-    assert!(error.to_string().contains("use --format jsonl"));
+fn search_and_check_use_json_and_reject_jsonl() {
+    assert!(Cli::try_parse_from(["pansou", "search", "仙逆", "--format", "json"]).is_ok());
+    let error = Cli::try_parse_from(["pansou", "search", "仙逆", "--format", "jsonl"]).unwrap_err();
+    assert!(error.to_string().contains("use --format json"));
     assert!(Cli::try_parse_from(["pansou", "check", "--stdin", "--format", "json"]).is_ok());
+    let error =
+        Cli::try_parse_from(["pansou", "check", "--stdin", "--format", "jsonl"]).unwrap_err();
+    assert!(error.to_string().contains("invalid value 'jsonl'"));
     let cli = Cli::try_parse_from(["pansou", "search", "仙逆", "--all-timeout", "600"]).unwrap();
     assert!(matches!(cli.command, Command::Search(args) if args.all_timeout == Some(600)));
 }

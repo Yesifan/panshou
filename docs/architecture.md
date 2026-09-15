@@ -3,13 +3,14 @@
 本文说明 PanSou Rust CLI 的运行时结构、模块边界和扩展方式。实现以
 `src/**` 为准，产品范围及兼容目标见
 [Rust CLI v1 规格](specs/RUST_CLI_V1_SPEC.md)及
-[频道、流式搜索与自更新规格](specs/CHANNEL_STREAM_UPDATE_SPEC.md)。
+[频道、搜索输出与自更新规格](specs/CHANNEL_STREAM_UPDATE_SPEC.md)。
 
 ## 1. 设计目标
 
 PanSou 是本地运行的异步 CLI，不提供 HTTP Server。它把 Telegram 和 19 个
 provider 的搜索结果统一为核心数据模型，再完成过滤、排序、网盘链接去重和可选的
-有效性检测。搜索按来源完成顺序流式输出 table 或 JSONL；独立检测仍支持 JSON。
+有效性检测。搜索期间在交互式终端显示动态进度，完成后输出最终 table 或 JSON；
+独立检测同样输出 table 或 JSON。
 
 架构遵循以下约束：
 
@@ -92,13 +93,12 @@ provider。每个被选择的频道或 provider 都视为一个独立 source。
 ```text
 选择 sources
   -> 共享并发请求（每 source timeout + 搜索阶段总时限）
-  -> 每个 source 完成后发送批次或 SourceError
+  -> 每个 source 完成后汇集批次或 SourceError，并更新进度
   -> 汇总确定失效的 TG source，一次性禁用已保存频道
   -> query/include/exclude/cloud 过滤
-  -> 批次内部排序，增量合并链接
-  -> result / result_update 事件
-  -> 可选并发检测后输出
-  -> 最终 summary
+  -> 合并、去重并稳定排序链接
+  -> 可选并发检测并更新进度
+  -> 最终 table / JSON 与 summary
 ```
 
 provider 可通过 `KeywordFilterMode` 声明关键词已由远端处理，避免 core 再次错误过滤；
@@ -197,11 +197,11 @@ CLI 参数 > PANSOU_* 环境变量 > 兼容环境变量 > config.toml > 默认�
 
 ### 3.9 Output (`src/output`)
 
-输出层消费类型化 `SearchEvent` 或 `CheckResult`：
+输出层消费最终 `SearchOutcome`、`SearchSummary`、检测摘要或独立 `CheckResult`：
 
-- 搜索 table 持续追加，元数据变化追加 `UPDATE`；
-- 搜索 JSONL 使用 `result`、`result_update`、`source_error`、`summary` 事件；
-- 独立 check 支持 table、JSON 和逐行检测结果 JSONL。
+- 搜索 table 一次性输出稳定排序的最终链接及末尾摘要；
+- 搜索 JSON 输出一个包含最终链接、来源状态和检测状态的格式化文档；
+- 独立 check 支持 table 和单个 JSON 文档。
 
 机器可读输出不混入日志。搜索的 `source_errors` 保留来源、错误类型和消息，以便调用方处理
 部分失败。
@@ -232,12 +232,13 @@ CLI 参数 > PANSOU_* 环境变量 > 兼容环境变量 > config.toml > 默认�
 搜索使用 Tokio 和 `FuturesUnordered`。TG 与 provider 共享默认 8 个 source 名额，
 `--jobs` 可调整。`--timeout` 默认 30 秒，从取得名额后计时，不含排队；
 `--all-timeout` 默认 600 秒，从搜索调度开始计时，包含排队但不含初始化和检测。
-到期停止调度并取消运行中的 future，不遗留后台搜索。跨来源结果按完成顺序输出，
-已输出链接的稳定 ID 用于后续更新，不承诺全局排名。
+到期停止调度并取消运行中的 future，不遗留后台搜索。搜索阶段内部按来源完成顺序汇集，
+最终统一合并、去重并稳定排序后输出。
 
 检测使用异步 stream 的 `buffer_unordered(jobs)` 限制请求并发。相同检测键一次只发出一个
 请求，再把结果复制回相应输入位置。
-流式搜索中的检测与来源事件接收并行，检测完成后输出，不阻塞搜索阶段总时限。
+搜索中的检测随来源结果到达并发执行，不计入搜索阶段总时限；stdout 仍等待所有来源汇集和
+已调度检测完成后再一次性输出最终结果。
 总时限到达后可继续处理已接收链接的检测；Ctrl-C 同时取消搜索和检测。
 
 单个 source 失败属于正常的部分失败：其他来源仍返回且进程退出 0；所有选择的 source
@@ -324,7 +325,7 @@ src/
 ├── http/                   # client、session、proxy、文本编码
 ├── state/                  # profile 存储和 AES-256-GCM
 ├── config/                 # TOML、环境覆盖、平台路径
-└── output/                 # table / JSON / JSONL
+└── output/                 # table / JSON
 
 tests/                      # 跨模块与 CLI 集成测试
 fixtures/providers/         # provider 协议与解析 fixture

@@ -3,18 +3,21 @@ use std::{
     future::Future,
     io::Write,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
     channel::ChannelStore,
     check::{CheckEngine, CheckItem, CheckOptions, CheckResult},
     core::{MergedLink, canonical_url_key},
-    output::{OutputFormat, stdout, write_search_event},
-    search::{FinishReason, SearchEngine, SearchEvent, SearchOptions, SearchSummary},
+    output::{OutputFormat, SearchCheckSummary, stdout, write_search},
+    search::{
+        FinishReason, SearchEngine, SearchEvent, SearchOptions, SearchOutcome, SearchSummary,
+    },
 };
 
 use super::{EXIT_DEADLINE, EXIT_INTERRUPTED, EXIT_OK, EXIT_SEARCH_FAILED};
@@ -27,7 +30,8 @@ pub(super) async fn run(
     check_options: CheckOptions,
     format: OutputFormat,
     require_ok: bool,
-    quiet: bool,
+    verbose: bool,
+    no_progress: bool,
     channel_store: ChannelStore,
 ) -> anyhow::Result<i32> {
     drive(
@@ -37,7 +41,8 @@ pub(super) async fn run(
         check_options,
         format,
         require_ok,
-        quiet,
+        verbose,
+        no_progress,
         Some(channel_store),
         stdout(),
         tokio::signal::ctrl_c(),
@@ -45,7 +50,78 @@ pub(super) async fn run(
     .await
 }
 
-type CheckTask = BoxFuture<'static, (String, String, CheckResult)>;
+type CheckTask = BoxFuture<'static, (String, CheckResult)>;
+
+struct SearchProgress {
+    multi: MultiProgress,
+    sources: ProgressBar,
+    checks: Option<ProgressBar>,
+}
+
+impl SearchProgress {
+    fn new(sources: usize, checks_enabled: bool, hidden: bool) -> Self {
+        let target = if hidden {
+            ProgressDrawTarget::hidden()
+        } else {
+            ProgressDrawTarget::stderr()
+        };
+        let multi = MultiProgress::with_draw_target(target);
+        let source_style = ProgressStyle::with_template(
+            "{spinner:.cyan} Searching [{bar:30.cyan/blue}] {pos}/{len} · {msg}",
+        )
+        .expect("valid search progress template")
+        .progress_chars("=>-");
+        let sources = multi.add(ProgressBar::new(sources as u64));
+        sources.set_style(source_style);
+        sources.set_message("0 candidates");
+        sources.enable_steady_tick(Duration::from_millis(120));
+
+        let checks = checks_enabled.then(|| {
+            let style = ProgressStyle::with_template(
+                "{spinner:.green} Checking  [{bar:30.green/blue}] {pos}/{len} · {msg}",
+            )
+            .expect("valid check progress template")
+            .progress_chars("=>-");
+            let bar = multi.add(ProgressBar::new(0));
+            bar.set_style(style);
+            bar.set_message("0 valid");
+            bar.enable_steady_tick(Duration::from_millis(120));
+            bar
+        });
+
+        Self {
+            multi,
+            sources,
+            checks,
+        }
+    }
+
+    fn update_sources(&self, completed: usize, links: usize) {
+        self.sources.set_position(completed as u64);
+        self.sources.set_message(format!("{links} candidates"));
+    }
+
+    fn add_check(&self) {
+        if let Some(checks) = &self.checks {
+            checks.inc_length(1);
+        }
+    }
+
+    fn complete_check(&self, valid: usize) {
+        if let Some(checks) = &self.checks {
+            checks.inc(1);
+            checks.set_message(format!("{valid} valid"));
+        }
+    }
+
+    fn clear(&self) {
+        self.sources.finish_and_clear();
+        if let Some(checks) = &self.checks {
+            checks.finish_and_clear();
+        }
+        let _ = self.multi.clear();
+    }
+}
 
 /// Check completion is polled alongside source events, so slow checks never
 /// prevent the search from making progress or reaching its own deadline.
@@ -57,30 +133,32 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
     check_options: CheckOptions,
     format: OutputFormat,
     require_ok: bool,
-    quiet: bool,
+    verbose: bool,
+    no_progress: bool,
     channel_store: Option<ChannelStore>,
     mut writer: W,
     interrupt: F,
 ) -> anyhow::Result<i32> {
     let started = Instant::now();
+    let source_count = options.providers.len() + options.channels.len();
+    let progress = SearchProgress::new(source_count, checker.is_some(), no_progress);
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let (cancel, cancellation) = watch::channel(false);
     let search = engine.search_stream(options, sender, cancellation);
     tokio::pin!(search, interrupt);
-    let mut summary: Option<SearchSummary> = None;
+    let mut completed: Option<(SearchOutcome, SearchSummary)> = None;
     let mut interrupted = false;
-    let mut latest = HashMap::<String, MergedLink>::new();
-    let mut emitted = HashMap::<String, MergedLink>::new();
     let mut checked = HashMap::<String, CheckResult>::new();
     let mut scheduled = HashSet::new();
     let mut pending = VecDeque::<(String, String, CheckItem)>::new();
     let mut checks = FuturesUnordered::<CheckTask>::new();
     let mut invalid_channels = HashSet::<String>::new();
+    let mut valid_checks = 0;
 
     loop {
         if let Some(checker) = &checker {
             while !interrupted && checks.len() < check_options.jobs.max(1) {
-                let Some((id, key, item)) = pending.pop_front() else {
+                let Some((_id, key, item)) = pending.pop_front() else {
                     break;
                 };
                 let checker = checker.clone();
@@ -89,13 +167,13 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
                 checks.push(
                     async move {
                         let result = checker.check(vec![item], options).await.remove(0);
-                        (id, key, result)
+                        (key, result)
                     }
                     .boxed(),
                 );
             }
         }
-        if summary.is_some() && receiver.is_empty() && checks.is_empty() && pending.is_empty() {
+        if completed.is_some() && receiver.is_empty() && checks.is_empty() && pending.is_empty() {
             break;
         }
         tokio::select! {
@@ -107,27 +185,24 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
                 checks.clear();
                 pending.clear();
             }
-            result = &mut search, if summary.is_none() => { summary = Some(result); }
+            result = &mut search, if completed.is_none() => { completed = Some(result); }
             Some(event) = receiver.recv() => {
                 match event {
                     SearchEvent::Result { id, link } | SearchEvent::ResultUpdate { id, link } => {
                         if interrupted { continue; }
-                        latest.insert(id.clone(), link.clone());
-                        if checker.is_none() {
-                            emit_link(&mut writer, &mut emitted, id, link, format, require_ok)?;
-                        } else {
+                        if checker.is_some() {
                             let key = check_key(&link);
-                            if let Some(result) = checked.get(&key) {
-                                emit_link(&mut writer, &mut emitted, id, attach_check(link, result), format, require_ok)?;
-                            } else if scheduled.insert(key.clone()) {
+                            if !checked.contains_key(&key) && scheduled.insert(key.clone()) {
                                 let mut item = CheckItem::detect(link.url);
                                 item.password = link.password;
                                 pending.push_back((id, key, item));
+                                progress.add_check();
                             }
                         }
                     }
                     SearchEvent::Progress { completed, selected, links } => {
-                        if !quiet { eprintln!("Sources: {completed}/{selected} finished · Links: {links}"); }
+                        debug_assert_eq!(selected, source_count);
+                        progress.update_sources(completed, links);
                     }
                     SearchEvent::Summary { .. } => {} // Final summary includes completed checks below.
                     SearchEvent::SourceError { ref error } => {
@@ -136,20 +211,21 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
                         {
                             invalid_channels.insert(channel.to_owned());
                         }
-                        if !quiet { eprintln!("{}: {}", error.source, error.message); }
-                        write_search_event(&mut writer, &event, format)?;
                     }
                 }
             }
-            Some((id, key, result)) = checks.next(), if !checks.is_empty() => {
-                if let Some(link) = latest.get(&id).filter(|link| check_key(link) == key) {
-                    emit_link(&mut writer, &mut emitted, id, attach_check(link.clone(), &result), format, require_ok)?;
+            Some((key, result)) = checks.next(), if !checks.is_empty() => {
+                if result.state == crate::check::CheckState::Ok {
+                    valid_checks += 1;
                 }
                 checked.insert(key, result);
+                progress.complete_check(valid_checks);
             }
         }
     }
-    let mut summary = summary.expect("search must complete before output loop ends");
+    progress.clear();
+    let (mut outcome, mut summary) =
+        completed.expect("search must complete before output loop ends");
     if let Some(store) = channel_store.filter(|_| !invalid_channels.is_empty()) {
         let mut names = invalid_channels.into_iter().collect::<Vec<_>>();
         names.sort();
@@ -166,7 +242,31 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
             );
         }
     }
-    summary.total_links = emitted.len();
+    if verbose {
+        for error in &outcome.source_errors {
+            eprintln!("{}: {}", error.source, error.message);
+        }
+    }
+
+    let candidates = outcome.total_links;
+    let mut final_checked = 0;
+    let mut final_valid = 0;
+    for links in outcome.links_by_type.values_mut() {
+        links.retain_mut(|link| {
+            let Some(result) = checked.get(&check_key(link)) else {
+                return !require_ok;
+            };
+            final_checked += 1;
+            *link = attach_check(link.clone(), result);
+            let valid = result.state == crate::check::CheckState::Ok;
+            final_valid += usize::from(valid);
+            valid || !require_ok
+        });
+    }
+    outcome.links_by_type.retain(|_, links| !links.is_empty());
+    outcome.total_links = outcome.links_by_type.values().map(Vec::len).sum();
+    outcome.duration_ms = started.elapsed().as_millis();
+    summary.total_links = outcome.total_links;
     summary.duration_ms = started.elapsed().as_millis();
     if interrupted {
         summary.finish_reason = FinishReason::Interrupted;
@@ -177,7 +277,13 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
         FinishReason::Completed if summary.sources_completed == 0 => EXIT_SEARCH_FAILED,
         FinishReason::Completed => EXIT_OK,
     };
-    write_search_event(&mut writer, &SearchEvent::Summary { summary }, format)?;
+    let checks = SearchCheckSummary {
+        enabled: checker.is_some(),
+        candidates,
+        checked: final_checked,
+        valid: final_valid,
+    };
+    write_search(&mut writer, &outcome, &summary, &checks, format)?;
     Ok(code)
 }
 
@@ -208,41 +314,13 @@ fn attach_check(mut link: MergedLink, value: &CheckResult) -> MergedLink {
     link
 }
 
-fn emit_link<W: Write>(
-    writer: &mut W,
-    emitted: &mut HashMap<String, MergedLink>,
-    id: String,
-    link: MergedLink,
-    format: OutputFormat,
-    require_ok: bool,
-) -> anyhow::Result<()> {
-    if require_ok
-        && !link
-            .check
-            .as_ref()
-            .is_some_and(|check| check.state == crate::core::CheckState::Ok)
-    {
-        return Ok(());
-    }
-    if emitted.get(&id) == Some(&link) {
-        return Ok(());
-    }
-    let update = emitted.insert(id.clone(), link.clone()).is_some();
-    let event = if update {
-        SearchEvent::ResultUpdate { id, link }
-    } else {
-        SearchEvent::Result { id, link }
-    };
-    write_search_event(writer, &event, format)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         channel::ChannelStore,
         check::{CheckCloudType, CheckContext, CheckError, CheckEvaluation, LinkChecker},
-        core::{Link, MergedLink, ProviderError, SearchResult, Source},
+        core::{Link, ProviderError, SearchResult},
         providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext},
         search::TelegramSource,
     };
@@ -272,12 +350,12 @@ mod tests {
         }
     }
     impl Buffer {
-        fn events(&self) -> Vec<serde_json::Value> {
-            String::from_utf8(self.0.lock().unwrap().clone())
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect()
+        fn is_empty(&self) -> bool {
+            self.0.lock().unwrap().is_empty()
+        }
+
+        fn document(&self) -> serde_json::Value {
+            serde_json::from_slice(&self.0.lock().unwrap()).unwrap()
         }
     }
 
@@ -331,6 +409,26 @@ mod tests {
         }
     }
 
+    struct BadChecker;
+    #[async_trait]
+    impl LinkChecker for BadChecker {
+        fn cloud_type(&self) -> CheckCloudType {
+            CheckCloudType::Quark
+        }
+
+        async fn check_normalized(
+            &self,
+            _: &CheckContext,
+            _: &CheckItem,
+            _: &str,
+        ) -> Result<CheckEvaluation, CheckError> {
+            Ok(CheckEvaluation::new(
+                crate::check::CheckState::Bad,
+                "invalid",
+            ))
+        }
+    }
+
     fn setup(providers: Vec<Arc<dyn Provider>>) -> (SearchEngine, SearchOptions) {
         (
             SearchEngine::new(SearchContext::new(
@@ -345,91 +443,52 @@ mod tests {
         )
     }
 
-    fn checked_link(state: crate::core::CheckState) -> MergedLink {
-        MergedLink {
-            cloud_type: crate::core::CloudType::Quark,
-            url: "https://pan.quark.cn/s/abc123".into(),
-            password: None,
-            note: "fixture".into(),
-            datetime: None,
-            source: Source::provider("fixture"),
-            images: Vec::new(),
-            check: Some(crate::core::CheckResult {
-                state,
-                cache_hit: false,
-                checked_at: None,
-                expires_at: None,
-                summary: None,
-            }),
-        }
-    }
-
     #[test]
-    fn require_ok_emits_ok_and_filters_every_other_check_state() {
-        let mut emitted = HashMap::new();
-        let mut output = Vec::new();
-        emit_link(
-            &mut output,
-            &mut emitted,
-            "ok".into(),
-            checked_link(crate::core::CheckState::Ok),
-            OutputFormat::Jsonl,
-            true,
-        )
-        .unwrap();
-        assert_eq!(emitted.len(), 1);
-
-        for state in [
-            crate::core::CheckState::Bad,
-            crate::core::CheckState::Locked,
-            crate::core::CheckState::Uncertain,
-            crate::core::CheckState::Unsupported,
-        ] {
-            emit_link(
-                &mut output,
-                &mut emitted,
-                format!("{state:?}"),
-                checked_link(state),
-                OutputFormat::Jsonl,
-                true,
-            )
-            .unwrap();
-        }
-
-        assert_eq!(emitted.len(), 1);
-        assert_eq!(
-            String::from_utf8(output)
-                .unwrap()
-                .lines()
-                .filter(|line| !line.is_empty())
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn unchecked_mode_emits_results_without_check_metadata() {
-        let mut link = checked_link(crate::core::CheckState::Bad);
-        link.check = None;
-        let mut emitted = HashMap::new();
-        let mut output = Vec::new();
-        emit_link(
-            &mut output,
-            &mut emitted,
-            "unchecked".into(),
-            link,
-            OutputFormat::Jsonl,
-            false,
-        )
-        .unwrap();
-
-        let event: serde_json::Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(event["event"], "result");
-        assert!(event["link"].get("check").is_none());
+    fn no_progress_uses_hidden_bars() {
+        let progress = SearchProgress::new(2, true, true);
+        assert!(progress.multi.is_hidden());
+        assert!(progress.sources.is_hidden());
+        assert!(progress.checks.as_ref().unwrap().is_hidden());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn writes_stdout_before_slow_source_finishes() {
+    async fn final_output_filters_invalid_checked_links() {
+        let (engine, options) = setup(vec![Arc::new(FixtureProvider {
+            delay: 0,
+            password: None,
+        })]);
+        let checker = Arc::new(CheckEngine::with_checkers(
+            reqwest::Client::new(),
+            None,
+            vec![Arc::new(BadChecker)],
+        ));
+        let mut output = Vec::new();
+        let code = drive(
+            engine,
+            options,
+            Some(checker),
+            CheckOptions::default(),
+            OutputFormat::Json,
+            true,
+            false,
+            true,
+            None,
+            &mut output,
+            futures::future::pending(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, EXIT_OK);
+        let document: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(document["total_links"], 0);
+        assert_eq!(document["checks"]["candidates"], 1);
+        assert_eq!(document["checks"]["checked"], 1);
+        assert_eq!(document["checks"]["valid"], 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn withholds_stdout_until_slow_source_finishes() {
         let (engine, options) = setup(vec![
             Arc::new(FixtureProvider {
                 delay: 0,
@@ -443,16 +502,15 @@ mod tests {
         let buffer = Buffer::default();
         let observer = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let events = buffer.events();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["event"], "result");
+            assert!(buffer.is_empty());
         };
         let output = drive(
             engine,
             options,
             None,
             CheckOptions::default(),
-            OutputFormat::Jsonl,
+            OutputFormat::Json,
+            false,
             false,
             true,
             None,
@@ -461,7 +519,7 @@ mod tests {
         );
         let (result, _) = tokio::join!(output, observer);
         assert_eq!(result.unwrap(), EXIT_OK);
-        assert_eq!(buffer.events().last().unwrap()["event"], "summary");
+        assert_eq!(buffer.document()["total_links"], 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -489,8 +547,9 @@ mod tests {
             options,
             Some(checker),
             CheckOptions::default(),
-            OutputFormat::Jsonl,
+            OutputFormat::Json,
             true,
+            false,
             true,
             None,
             buffer.clone(),
@@ -499,10 +558,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(code, EXIT_DEADLINE);
-        let events = buffer.events();
-        assert_eq!(events[0]["event"], "result");
-        assert_eq!(events[0]["link"]["check"]["state"], "ok");
-        let summary = &events.last().unwrap()["summary"];
+        let document = buffer.document();
+        assert_eq!(
+            document["links_by_type"]["quark"][0]["check"]["state"],
+            "ok"
+        );
+        let summary = &document["summary"];
         assert_eq!(summary["finish_reason"], "deadline");
         assert_eq!(summary["sources_completed"], 1);
         assert_eq!(summary["sources_cancelled"], 1);
@@ -533,8 +594,9 @@ mod tests {
             options,
             Some(checker),
             CheckOptions::default(),
-            OutputFormat::Jsonl,
+            OutputFormat::Json,
             true,
+            false,
             true,
             None,
             buffer.clone(),
@@ -543,9 +605,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(code, EXIT_OK);
-        let events = buffer.events();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["link"]["password"], "abcd");
+        let document = buffer.document();
+        assert_eq!(document["links_by_type"]["quark"][0]["password"], "abcd");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -570,7 +631,8 @@ mod tests {
             options,
             Some(checker),
             CheckOptions::default(),
-            OutputFormat::Jsonl,
+            OutputFormat::Json,
+            false,
             false,
             true,
             None,
@@ -580,11 +642,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(code, EXIT_INTERRUPTED);
-        assert_eq!(buffer.events().len(), 1);
-        assert_eq!(
-            buffer.events()[0]["summary"]["finish_reason"],
-            "interrupted"
-        );
+        assert_eq!(buffer.document()["summary"]["finish_reason"], "interrupted");
     }
 
     #[tokio::test]
@@ -636,7 +694,8 @@ mod tests {
             options,
             None,
             CheckOptions::default(),
-            OutputFormat::Jsonl,
+            OutputFormat::Json,
+            false,
             false,
             true,
             Some(store.clone()),

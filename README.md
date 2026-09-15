@@ -1,7 +1,7 @@
 # PanSou CLI
 
 PanSou 是一个以 Rust 编写的本地网盘资源搜索与链接检测工具。它从 Telegram
-频道和多个 provider 并发检索内容，合并、过滤并增量去重输出链接，也可以独立检测
+频道和多个 provider 并发检索内容，合并、过滤、去重并稳定输出最终链接，也可以独立检测
 网盘分享链接的有效性。
 
 ## 安装
@@ -36,16 +36,17 @@ pansou channel add @foo https://t.me/bar
 pansou channel import --builtin
 pansou channel list
 
-# 机器可读流式搜索
-pansou search "仙逆" --format jsonl
+# 机器可读的最终搜索摘要
+pansou search "仙逆" --format json
 
 # 检查并安装更新
 pansou update --check
 pansou update
 ```
 
-搜索默认按来源完成顺序持续输出表格，也支持 JSONL 事件流；搜索 JSON 格式已移除，
-独立 `check` 仍支持 JSON。TG 与 provider 共享默认 8 并发，单来源默认超时 30 秒，
+交互式搜索默认显示动态进度条，并在完成后一次性输出最终表格；可用 `--no-progress`
+隐藏进度；stderr 不是交互式终端时也会自动隐藏。搜索和独立 `check` 均支持 table 与
+单个 JSON 文档。TG 与 provider 共享默认 8 并发，单来源默认超时 30 秒，
 搜索阶段总时限默认 600 秒（`--all-timeout`），不包含初始化和链接检测。
 资源命名可能不规范，建议使用简短的核心关键词。
 

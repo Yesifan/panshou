@@ -136,7 +136,7 @@ Rust v1 必须包含：
 
 12. HTTP / HTTPS / SOCKS5 proxy
 
-13. table / json / jsonl 输出
+13. 搜索与独立 check 均支持 table / json 输出
 
 14. 网盘链接有效性检测
 
@@ -257,12 +257,14 @@ pansou search <QUERY>
 
   --jobs <N>
   --timeout <SECONDS>
+  --all-timeout <SECONDS>
 
   --proxy <URL>
 
-  --format <table|json|jsonl>
+  --format <table|json>
 
   --no-check
+  --no-progress
 
   --verbose
   --quiet
@@ -1005,8 +1007,7 @@ src/
 └── output/
     ├── mod.rs
     ├── table.rs
-    ├── json.rs
-    └── jsonl.rs
+    └── json.rs
 ```
 
 不要创建：
@@ -1923,7 +1924,7 @@ cat links.txt | pansou check --stdin
 --refresh
 --no-cache
 
---format <table|json|jsonl>
+--format <table|json>
 
 --fail-invalid
 ```
@@ -2180,7 +2181,7 @@ exit 0
 这样方便：
 
 ```bash
-pansou search xxx --json | jq ...
+pansou search xxx --format json | jq ...
 ```
 
 ---
@@ -2204,11 +2205,16 @@ stdout = 数据
 stderr
 ```
 
-`--quiet`：
+`search --no-progress`：
 
 ```text
-只输出数据
+隐藏动态进度，只输出最终数据和必要诊断
 ```
+
+`search --quiet` 还会压低非必要诊断日志，不能与 `--verbose` 同时使用。
+
+stderr 非 TTY 时搜索进度自动隐藏；进度从不写入 stdout。独立 `check` 支持
+table/json 输出契约。
 
 `--verbose`：
 
@@ -2811,13 +2817,13 @@ QQPD 再实现 opportunistic keepalive。
 完成：
 
 ```text
-table/json/jsonl
+search/check table/json
 
 stderr/stdout isolation
 
 exit code
 
---quiet
+--no-progress
 --verbose
 
 search 默认检测并过滤
@@ -3208,7 +3214,7 @@ CLI:
 
 [ ] search json
 
-[ ] search jsonl
+[ ] search 单个 JSON 总结文档
 
 [ ] provider selection
 
