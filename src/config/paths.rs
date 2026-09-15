@@ -7,6 +7,7 @@ use thiserror::Error;
 pub struct AppPaths {
     pub config_dir: PathBuf,
     pub config_file: PathBuf,
+    pub channels_file: PathBuf,
     pub state_dir: PathBuf,
     pub providers_dir: PathBuf,
     pub cache_dir: PathBuf,
@@ -38,6 +39,7 @@ impl AppPaths {
         let cache_dir = cache_dir.into();
         Self {
             config_file: config_dir.join("config.toml"),
+            channels_file: config_dir.join("channels.toml"),
             providers_dir: state_dir.join("providers"),
             check_cache: cache_dir.join("check.redb"),
             config_dir,

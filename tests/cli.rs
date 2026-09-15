@@ -79,3 +79,24 @@ fn provider_password_is_never_a_command_line_argument() {
 fn verbose_and_quiet_conflict() {
     assert!(Cli::try_parse_from(["pansou", "search", "仙逆", "--verbose", "--quiet"]).is_err());
 }
+
+#[test]
+fn search_json_is_removed_but_check_json_remains() {
+    let error = Cli::try_parse_from(["pansou", "search", "仙逆", "--format", "json"]).unwrap_err();
+    assert!(error.to_string().contains("use --format jsonl"));
+    assert!(Cli::try_parse_from(["pansou", "check", "--stdin", "--format", "json"]).is_ok());
+    let cli = Cli::try_parse_from(["pansou", "search", "仙逆", "--all-timeout", "600"]).unwrap();
+    assert!(matches!(cli.command, Command::Search(args) if args.all_timeout == Some(600)));
+}
+
+#[test]
+fn channel_import_and_update_arguments() {
+    for source in ["./channels.txt", "https://example.com/channels.txt"] {
+        assert!(Cli::try_parse_from(["pansou", "channel", "import", source]).is_ok());
+    }
+    assert!(Cli::try_parse_from(["pansou", "channel", "import", "--builtin"]).is_ok());
+    assert!(Cli::try_parse_from(["pansou", "channel", "import"]).is_err());
+    assert!(Cli::try_parse_from(["pansou", "channel", "import", "--builtin", "list.txt"]).is_err());
+    assert!(Cli::try_parse_from(["pansou", "channel", "add", "@foo", "https://t.me/bar"]).is_ok());
+    assert!(Cli::try_parse_from(["pansou", "update", "--check", "--version", "v0.2.0"]).is_ok());
+}

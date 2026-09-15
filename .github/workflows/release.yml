@@ -48,6 +48,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Verify release tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "pansou"))')
+          test "$GITHUB_REF_NAME" = "v$version"
       - name: Install cross
         if: matrix.builder == 'cross'
         uses: taiki-e/install-action@cross
@@ -91,7 +97,12 @@ jobs:
           merge-multiple: true
       - name: Create SHA256SUMS
         working-directory: dist
-        run: sha256sum pansou-*.tar.gz pansou-*.zip > SHA256SUMS
+        run: |
+          for asset in pansou-linux-x86_64.tar.gz pansou-linux-aarch64.tar.gz pansou-macos-x86_64.tar.gz pansou-macos-aarch64.tar.gz pansou-windows-x86_64.zip; do
+            test -s "$asset"
+          done
+          sha256sum pansou-*.tar.gz pansou-*.zip > SHA256SUMS
+          sha256sum --check SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: pansou-checksums

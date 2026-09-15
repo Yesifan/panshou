@@ -30,7 +30,8 @@ impl TelegramSource {
         channel: &str,
         query: &str,
     ) -> Result<Vec<SearchResult>, ProviderError> {
-        let channel = normalize_channel(channel)?;
+        let channel = crate::channel::normalize_channel(channel)
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
         let mut url = self
             .base_url
             .join(&format!("s/{channel}"))
@@ -59,18 +60,6 @@ impl TelegramSource {
     }
 }
 
-fn normalize_channel(channel: &str) -> Result<String, ProviderError> {
-    let channel = channel.trim().trim_start_matches('@');
-    if channel.is_empty()
-        || !channel
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return Err(ProviderError::Protocol("invalid Telegram channel".into()));
-    }
-    Ok(channel.to_owned())
-}
-
 pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, ProviderError> {
     let document = Html::parse_document(html);
     let wrap = selector(".tgme_widget_message_wrap")?;
@@ -80,6 +69,7 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
     let image = selector(".tgme_widget_message_photo_wrap")?;
     let inline_image = selector(".tgme_widget_message_bubble img[src]")?;
     let anchor = selector("a[href]")?;
+    let keyboard_anchor = selector(".tgme_widget_message_inline_keyboard a[href]")?;
     let tag = selector("a[href^='?q=%23']")?;
 
     let mut results = Vec::new();
@@ -93,17 +83,16 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
         let Some((_, id)) = post.rsplit_once('/') else {
             continue;
         };
-        let Some(text_node) = message_node.select(&text).next() else {
-            continue;
-        };
+        let text_node = message_node.select(&text).next();
         let content = text_node
-            .text()
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(|node| node.text().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
             .trim()
             .to_owned();
+        let buttons: Vec<_> = message_node.select(&keyboard_anchor).collect();
         let mut links = extract_links(&content);
-        for node in text_node.select(&anchor) {
+        let body_anchors = text_node.into_iter().flat_map(|node| node.select(&anchor));
+        for node in body_anchors.chain(buttons.iter().copied()) {
             let Some(href) = node.value().attr("href") else {
                 continue;
             };
@@ -111,7 +100,9 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
             if link.cloud_type == crate::core::CloudType::Others {
                 continue;
             }
-            link.password = extract_password(&content, href);
+            let label = node.text().collect::<Vec<_>>().join(" ");
+            link.password =
+                extract_password(&label, href).or_else(|| extract_password(&content, href));
             let key = canonical_url_key(href);
             if let Some(existing) = links
                 .iter_mut()
@@ -127,6 +118,16 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
         if links.is_empty() {
             continue;
         }
+        let button_text = buttons
+            .iter()
+            .map(|node| node.text().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = if content.is_empty() {
+            button_text
+        } else {
+            content
+        };
         let title: String = content
             .lines()
             .map(str::trim)
@@ -163,7 +164,8 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
             }
         }
         let tags = text_node
-            .select(&tag)
+            .into_iter()
+            .flat_map(|node| node.select(&tag))
             .filter_map(|node| {
                 node.text()
                     .collect::<String>()
@@ -221,5 +223,32 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn parses_keyboard_links_with_local_passwords_and_body_fallback() {
+        let values = parse_telegram(
+            include_str!("../../tests/fixtures/telegram/keyboard_success.html"),
+            "demo",
+        )
+        .unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].links.len(), 2);
+        assert_eq!(values[0].links[0].password.as_deref(), Some("a1b2"));
+        assert_eq!(values[0].links[1].password.as_deref(), Some("c3d4"));
+        assert_eq!(values[1].links.len(), 1);
+        assert_eq!(values[1].links[0].password.as_deref(), Some("e5f6"));
+        assert!(values[1].title.contains("凡人修仙传"));
+        assert_eq!(values[2].links[0].password.as_deref(), Some("g7h8"));
+    }
+
+    #[test]
+    fn empty_and_malformed_keyboards_do_not_create_results() {
+        for html in [
+            include_str!("../../tests/fixtures/telegram/keyboard_empty.html"),
+            include_str!("../../tests/fixtures/telegram/keyboard_malformed.html"),
+        ] {
+            assert!(parse_telegram(html, "demo").unwrap().is_empty());
+        }
     }
 }

@@ -40,7 +40,7 @@ fn text_password_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:(?:提取|访问|提取密|密)码|pwd)\s*[：:]\s*([a-z0-9]{4,6})(?:[^a-z0-9]|$)",
+            r"(?i)(?:(?:提取|访问|提取密|密)码|pwd)(?:\s*[：:]\s*|\s+)([a-z0-9]{4,6})(?:[^a-z0-9]|$)",
         )
         .unwrap()
     })
@@ -297,4 +297,26 @@ fn clean_title(value: &str) -> String {
         .unwrap_or(value.trim())
         .trim()
         .to_owned()
+}
+
+#[cfg(test)]
+mod password_tests {
+    use super::extract_password;
+
+    #[test]
+    fn accepts_colon_or_whitespace_password_separator() {
+        for label in ["提取码 c3d4", "提取码：c3d4", "提取码: c3d4"] {
+            assert_eq!(extract_password(label, "").as_deref(), Some("c3d4"));
+        }
+        assert_eq!(extract_password("提取码c3d4", ""), None);
+        assert_eq!(extract_password("提取码 abcdefg", ""), None);
+    }
+
+    #[test]
+    fn url_password_precedes_button_label() {
+        assert_eq!(
+            extract_password("提取码 c3d4", "https://pan.quark.cn/s/demo?pwd=a1b2").as_deref(),
+            Some("a1b2")
+        );
+    }
 }

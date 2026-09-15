@@ -53,3 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release --locked --all-features
+      - name: Verify platform updater and migrations
+        run: |
+          cargo test --locked --lib update::
+          cargo test --locked --lib migration::

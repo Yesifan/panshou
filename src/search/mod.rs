@@ -1,5 +1,8 @@
 mod engine;
 mod telegram;
 
-pub use engine::{SearchEngine, SearchOptions, SearchOutcome, SourceError};
+pub use engine::{
+    FinishReason, SearchEngine, SearchEvent, SearchOptions, SearchOutcome, SearchSummary,
+    SourceError,
+};
 pub use telegram::{TelegramSource, parse_telegram};

@@ -1,9 +1,12 @@
+pub mod channel;
 pub mod check;
 pub mod cli;
 pub mod config;
 pub mod core;
 pub mod http;
+pub mod migration;
 pub mod output;
 pub mod providers;
 pub mod search;
 pub mod state;
+pub mod update;

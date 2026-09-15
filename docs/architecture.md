@@ -1,14 +1,15 @@
 # PanSou Rust CLI 整体架构
 
-本文说明 PanSou Rust CLI v1 的运行时结构、模块边界和扩展方式。实现以
+本文说明 PanSou Rust CLI 的运行时结构、模块边界和扩展方式。实现以
 `src/**` 为准，产品范围及兼容目标见
-[RUST_CLI_V1_SPEC.md](specs/RUST_CLI_V1_SPEC.md)。
+[Rust CLI v1 规格](specs/RUST_CLI_V1_SPEC.md)及
+[频道、流式搜索与自更新规格](specs/CHANNEL_STREAM_UPDATE_SPEC.md)。
 
 ## 1. 设计目标
 
 PanSou 是本地运行的异步 CLI，不提供 HTTP Server。它把 Telegram 和 19 个
 provider 的搜索结果统一为核心数据模型，再完成过滤、排序、网盘链接去重和可选的
-有效性检测，最终输出 table、JSON 或 JSONL。
+有效性检测。搜索按来源完成顺序流式输出 table 或 JSONL；独立检测仍支持 JSON。
 
 架构遵循以下约束：
 
@@ -53,13 +54,15 @@ SearchEngine -> core merge/filter/rank -> optional CheckEngine -> output
 
 ### 3.1 CLI (`src/cli`)
 
-CLI 是应用编排边界，定义四组命令：
+CLI 是应用编排边界，提供以下命令：
 
 - `search`：解析来源、provider、频道、过滤条件、并发数、超时、代理、输出格式以及
   `--check`/`--valid-only`。
 - `check`：接收参数或 stdin 中的链接，调用检测引擎。
 - `provider`：列举 provider/profile，并执行登录、退出、状态查询和配置。
 - `config`：显示合并后的配置或配置文件路径。
+- `channel`：管理独立频道文件、启停频道和导入候选清单。
+- `update`：检查或安装 GitHub Release，衔接兼容性检查及迁移提示。
 
 CLI 负责装配 `Config`、`AppPaths`、HTTP client、`StateStore`、provider registry、
 `SearchEngine` 和 `CheckEngine`。核心库返回结构化结果，CLI 决定 stdout/stderr 以及退出码。
@@ -88,17 +91,20 @@ provider。每个被选择的频道或 provider 都视为一个独立 source。
 
 ```text
 选择 sources
-  -> 并发请求（每 source 独立 timeout）
-  -> 分离成功批次与 SourceError
-  -> 按选择顺序稳定合并
+  -> 共享并发请求（每 source timeout + 搜索阶段总时限）
+  -> 每个 source 完成后发送批次或 SourceError
   -> query/include/exclude/cloud 过滤
-  -> 排序
-  -> 展平并按 URL 合并链接
-  -> 按 cloud type 分组
+  -> 批次内部排序，增量合并链接
+  -> result / result_update 事件
+  -> 可选并发检测后输出
+  -> 最终 summary
 ```
 
 provider 可通过 `KeywordFilterMode` 声明关键词已由远端处理，避免 core 再次错误过滤；
 Telegram 和 `Core` 模式的 provider 由搜索引擎执行本地 query 过滤。
+TG 正文命中完整查询时保留消息链接，否则按链接 work_title（缺失时消息标题）过滤。
+Telegram 每频道只请求一个公开搜索页面，解析正文及 inline keyboard 的资源链接和密码，
+按规范化 URL 去重；没有正文但存在有效按钮链接的消息也可保留。
 
 ### 3.4 Providers (`src/providers`)
 
@@ -172,36 +178,60 @@ Redb 仅作为 check cache 使用。不同状态有不同 TTL；`--refresh` 跳�
 CLI 参数 > PANSOU_* 环境变量 > 兼容环境变量 > config.toml > 默认值
 ```
 
-配置覆盖网络代理和超时、搜索并发/频道/provider、检测缓存/并发，以及少量 provider
+配置覆盖网络代理和超时、搜索并发/总时限/provider、检测缓存/并发，以及少量 provider
 非敏感设置。敏感登录态不写入 `config.toml`，而由 `StateStore` 管理。
 
 `AppPaths` 通过平台目录计算：
 
 ```text
 <config>/pansou/config.toml
+<config>/pansou/channels.toml
 <state>/pansou/providers/<provider>/<profile>.json
 <cache>/pansou/check.redb
 ```
 
 ### 3.9 Output (`src/output`)
 
-输出层只消费结构化 `SearchOutcome` 或 `CheckResult`：
+输出层消费类型化 `SearchEvent` 或 `CheckResult`：
 
-- table 面向终端阅读；
-- JSON 提供稳定的整体 envelope；
-- JSONL 每行一个合并链接或检测结果，便于流式管道处理。
+- 搜索 table 持续追加，元数据变化追加 `UPDATE`；
+- 搜索 JSONL 使用 `result`、`result_update`、`source_error`、`summary` 事件；
+- 独立 check 支持 table、JSON 和逐行检测结果 JSONL。
 
 机器可读输出不混入日志。搜索的 `source_errors` 保留来源、错误类型和消息，以便调用方处理
 部分失败。
 
+### 3.10 Channel (`src/channel`)
+
+独立文件保存格式版本、规范化频道名称和 enabled 状态。管理命令使用同一规范化和上限
+校验逻辑；最多启用 128 个，本次运行覆盖的频道也受此限制。导入支持编译期候选清单、
+本地文件和 HTTP(S)，新增项禁用、已有项保持状态。文件锁覆盖读取到原子替换的完整过程。
+
+旧 `config.toml` 的 `search.channels` 仅用于识别废弃提示，不生效也不自动迁移。
+本次选择使用 CLI > PANSOU_CHANNELS > CHANNELS > 独立文件启用项，各层整体覆盖。
+
+### 3.11 Update / Migration (`src/update`, `src/migration`)
+
+更新模块查询项目 GitHub Releases，选择平台资产并校验 SHA-256，在兼容性预检后备份并
+替换当前程序。Unix 使用同目录替换，Windows 使用退出后的辅助替换流程。
+普通搜索不触发更新检查；下载、校验或预检失败不替换旧程序。
+
+迁移由数据格式版本驱动，逻辑随二进制发布，不执行远端迁移脚本。确定性变更备份后转换；
+需用户选择的变更输出稳定事项提示。正常启动也检查，兼容手动安装升级。
+更新成功但迁移失败单独报告，不把二进制回退等同于数据回滚。
+
 ## 4. 并发与超时模型
 
-搜索使用 Tokio、`FuturesUnordered` 和 `Semaphore`。`--jobs` 限制同时运行的 source 数，
-每个 source 外层再使用 `tokio::time::timeout`，因此慢站点不会无限占用任务。异步完成顺序
-不会改变结果确定性：批次和错误在合并前按 source 的选择序号排序。
+搜索使用 Tokio 和 `FuturesUnordered`。TG 与 provider 共享默认 8 个 source 名额，
+`--jobs` 可调整。`--timeout` 默认 30 秒，从取得名额后计时，不含排队；
+`--all-timeout` 默认 600 秒，从搜索调度开始计时，包含排队但不含初始化和检测。
+到期停止调度并取消运行中的 future，不遗留后台搜索。跨来源结果按完成顺序输出，
+已输出链接的稳定 ID 用于后续更新，不承诺全局排名。
 
 检测使用异步 stream 的 `buffer_unordered(jobs)` 限制请求并发。相同检测键一次只发出一个
 请求，再把结果复制回相应输入位置。
+流式搜索中的检测与来源事件接收并行，检测完成后输出，不阻塞搜索阶段总时限。
+总时限到达后可继续处理已接收链接的检测；Ctrl-C 同时取消搜索和检测。
 
 单个 source 失败属于正常的部分失败：其他来源仍返回且进程退出 0；所有选择的 source
 都失败时退出 3。架构中没有自定义线程池、后台搜索任务或搜索缓存。
@@ -222,6 +252,11 @@ auth required、rate limited、blocked、protocol 和 unavailable。CLI 边界�
 | 4 | 显式选择的 provider 需要认证 |
 | 5 | 全局初始化或网络设施错误 |
 | 10 | `check --fail-invalid` 检测到 `bad`/`locked` |
+| 124 | 搜索阶段总时限到达，保留已接收结果 |
+| 130 | 用户中断 |
+
+最终 summary 的 `partial` 表示有来源未成功完成；成功空结果不算失败。摘要区分完成、
+失败、运行中取消和尚未开始来源，保留搜索阶段与整体耗时。
 
 provider 失败会进入 `SearchOutcome.source_errors`；check 的暂时性错误通常归一为
 `uncertain`，避免把网络故障误判成链接失效。

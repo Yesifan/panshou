@@ -10,12 +10,16 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+mod channel;
+mod streaming;
+mod upgrade;
+
 use crate::{
     check::{CheckCache, CheckEngine, CheckItem, CheckOptions, CheckState, proxy_scope},
     config::{AppPaths, Config, ConfigOverrides},
     core::CloudType,
     http::{ClientOptions, HttpClientFactory, ProxyUrl, RedirectPolicy},
-    output::{OutputFormat, stdout, write_checks, write_search},
+    output::{OutputFormat, stdout, write_checks},
     providers::{
         Provider, SearchContext, builtin_stateless_providers,
         gying::{Endpoints as GyingEndpoints, GyingProfile, GyingProvider},
@@ -33,6 +37,10 @@ pub const EXIT_SEARCH_FAILED: i32 = 3;
 pub const EXIT_AUTH_REQUIRED: i32 = 4;
 pub const EXIT_INIT: i32 = 5;
 pub const EXIT_INVALID_LINK: i32 = 10;
+pub const EXIT_DEADLINE: i32 = 124;
+pub const EXIT_INTERRUPTED: i32 = 130;
+
+const SEARCH_GUIDANCE: &str = "搜索来源中的资源命名可能不规范。建议使用简短的核心关键词，关键词过长可能降低搜索效果。\nResults stream as sources finish. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -46,6 +54,9 @@ pub fn error_exit_code(error: &anyhow::Error) -> i32 {
     if error.downcast_ref::<UsageError>().is_some()
         || error.downcast_ref::<crate::config::ConfigError>().is_some()
         || error.downcast_ref::<crate::core::ParseError>().is_some()
+        || error
+            .downcast_ref::<crate::channel::ChannelError>()
+            .is_some()
     {
         EXIT_USAGE
     } else if matches!(
@@ -62,7 +73,8 @@ pub fn error_exit_code(error: &anyhow::Error) -> i32 {
 #[command(
     name = "pansou",
     version,
-    about = "Search and validate cloud-drive links"
+    about = "Search and validate cloud-drive links",
+    after_help = SEARCH_GUIDANCE
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -75,6 +87,22 @@ pub enum Command {
     Check(CheckArgs),
     Provider(ProviderArgs),
     Config(ConfigArgs),
+    Channel(channel::ChannelArgs),
+    Update(upgrade::UpdateArgs),
+    #[command(name = "__update-preflight", hide = true)]
+    UpdatePreflight {
+        config_dir: std::path::PathBuf,
+    },
+    #[command(name = "__update-finish", hide = true)]
+    UpdateFinish {
+        config_dir: std::path::PathBuf,
+    },
+    #[command(name = "__update-replace", hide = true)]
+    UpdateReplace {
+        staged: std::path::PathBuf,
+        target: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -85,6 +113,7 @@ pub enum SourceSelection {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = SEARCH_GUIDANCE)]
 pub struct SearchArgs {
     pub query: String,
     #[arg(long, value_enum, default_value_t = SourceSelection::All)]
@@ -99,13 +128,21 @@ pub struct SearchArgs {
     pub include: Vec<String>,
     #[arg(long = "exclude")]
     pub exclude: Vec<String>,
-    #[arg(long)]
+    #[arg(long, help = "Shared source concurrency (default: 8)")]
     pub jobs: Option<usize>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Per-source timeout in seconds, excluding queueing (default: 30)"
+    )]
     pub timeout: Option<u64>,
+    #[arg(
+        long,
+        help = "Search deadline in seconds, including queueing (default: 600)"
+    )]
+    pub all_timeout: Option<u64>,
     #[arg(long)]
     pub proxy: Option<String>,
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    #[arg(long, value_parser = parse_search_format, default_value = "table", help = "Streaming output: table or jsonl")]
     pub format: OutputFormat,
     #[arg(long)]
     pub check: bool,
@@ -213,8 +250,59 @@ pub enum ConfigCommand {
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<i32> {
+    // Repair and update entry points must not depend on valid search configuration.
+    match cli.command {
+        Command::UpdatePreflight { config_dir } => {
+            crate::migration::preflight(&config_dir)?;
+            return Ok(EXIT_OK);
+        }
+        Command::UpdateFinish { config_dir } => {
+            for notice in crate::migration::check(&config_dir)? {
+                println!("{}", notice.message);
+            }
+            return Ok(EXIT_OK);
+        }
+        Command::UpdateReplace {
+            staged,
+            target,
+            config_dir,
+        } => {
+            return upgrade::print_outcome(crate::update::replace_after_exit(
+                &staged,
+                &target,
+                &config_dir,
+            )?);
+        }
+        _ => {}
+    }
     let paths = AppPaths::discover()?;
-    let mut config = Config::load(&paths)?;
+    if let Command::Channel(args) = cli.command {
+        return channel::run(args, &paths).await;
+    }
+    if let Command::Update(args) = cli.command {
+        return upgrade::run(args, &paths).await;
+    }
+    if matches!(
+        cli.command,
+        Command::Config(ConfigArgs {
+            command: ConfigCommand::Path
+        })
+    ) {
+        println!("{}", paths.config_file.display());
+        return Ok(EXIT_OK);
+    }
+    let quiet = matches!(&cli.command, Command::Search(args) if args.quiet);
+    for notice in crate::migration::notices(&paths.config_dir)? {
+        if !quiet {
+            eprintln!("{}", notice.message);
+        }
+    }
+    let uses_channels = matches!(&cli.command, Command::Search(args) if args.source != SourceSelection::Provider && args.channels.is_empty() && std::env::var_os("PANSOU_CHANNELS").is_none() && std::env::var_os("CHANNELS").is_none());
+    let mut config = if uses_channels {
+        Config::load(&paths)?
+    } else {
+        Config::load_without_channels(&paths)?
+    };
     match cli.command {
         Command::Search(args) => run_search(args, &paths, config).await,
         Command::Check(args) => run_check(args, &paths, config).await,
@@ -226,7 +314,75 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             Ok(EXIT_OK)
         }
+        _ => unreachable!("maintenance commands handled before configuration loading"),
     }
+}
+
+fn parse_search_format(value: &str) -> Result<OutputFormat, String> {
+    match value {
+        "table" => Ok(OutputFormat::Table),
+        "jsonl" => Ok(OutputFormat::Jsonl),
+        "json" => Err("search JSON output was removed; use --format jsonl".into()),
+        _ => Err("expected table or jsonl".into()),
+    }
+}
+
+/// Read-only help: a broken configuration should never hide static usage.
+pub fn help_defaults() -> String {
+    let summary = (|| -> anyhow::Result<String> {
+        let paths = AppPaths::discover()?;
+        let config = if std::env::var_os("PANSOU_CHANNELS").is_some()
+            || std::env::var_os("CHANNELS").is_some()
+        {
+            Config::load_without_channels(&paths)?
+        } else {
+            Config::load(&paths)?
+        };
+        let store = StateStore::from_paths(&paths)?;
+        let mut providers = builtin_stateless_providers()
+            .into_iter()
+            .filter(|provider| {
+                config
+                    .search
+                    .providers
+                    .iter()
+                    .any(|name| name == provider.meta().name)
+            })
+            .count();
+        for name in ["qqpd", "weibo", "gying", "panlian"] {
+            if stateful_ready(&store, name)? {
+                providers += 1;
+            }
+        }
+        let channels = crate::channel::validate_search_channels(&config.search.channels)?.len();
+        Ok(search_defaults_text(
+            providers,
+            channels,
+            config.search.jobs,
+            config.network.timeout_secs,
+            config.search.all_timeout_secs,
+        ))
+    })();
+    match summary {
+        Ok(text) => text,
+        Err(error) => format!("Current search defaults: unavailable ({error})."),
+    }
+}
+
+fn search_defaults_text(
+    providers: usize,
+    channels: usize,
+    jobs: usize,
+    timeout: u64,
+    all_timeout: u64,
+) -> String {
+    let seconds = (providers + channels).div_ceil(jobs.max(1)) as u64;
+    let seconds = seconds.saturating_mul(timeout).min(all_timeout);
+    format!(
+        "Current search defaults:\n  Providers: {providers}\n  Enabled channels: {channels}/{}\n  Concurrency: {jobs}\n  Timeout per source: {timeout}s\n  Overall search timeout: {all_timeout}s\n  Estimated maximum search wait: ~{seconds}s (~{:.1}m)\nResults stream as sources finish. Initialization and link checking may take additional time.",
+        crate::channel::MAX_ENABLED_CHANNELS,
+        seconds as f64 / 60.0
+    )
 }
 
 fn client(
@@ -328,51 +484,52 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
     config.apply_overrides(ConfigOverrides {
         proxy: args.proxy.clone(),
         timeout_secs: args.timeout,
+        all_timeout_secs: args.all_timeout,
         search_jobs: args.jobs,
         channels: (!args.channels.is_empty()).then(|| args.channels.clone()),
         providers: (!args.providers.is_empty()).then(|| args.providers.clone()),
         check_jobs: None,
     })?;
     let (http, proxy, timeout, client_options) = client(&config, args.proxy, args.timeout)?;
-    let store = StateStore::from_paths(paths)?;
-    let mut available = builtin_stateless_providers();
-    available.extend(configured_stateful(&store, &config, &client_options)?);
-    let explicit = !args.providers.is_empty();
-    let selected_names: HashSet<_> = if !explicit {
-        let mut names = config
-            .search
-            .providers
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        for name in ["qqpd", "weibo", "gying", "panlian"] {
-            if !store.list_profiles(name)?.is_empty() {
-                names.insert(name);
-            }
-        }
-        names
-    } else {
-        args.providers.iter().map(String::as_str).collect()
-    };
-    let known = available
-        .iter()
-        .map(|provider| provider.meta().name)
-        .chain(["qqpd", "weibo", "gying", "panlian"])
-        .collect::<HashSet<_>>();
-    if let Some(name) = selected_names.iter().find(|name| !known.contains(**name)) {
-        return Err(usage(format!("unknown provider: {name}")));
-    }
-    if explicit {
-        for name in ["qqpd", "weibo", "gying", "panlian"] {
-            if selected_names.contains(name) && !stateful_ready(&store, name)? {
-                eprintln!("provider {name} requires login");
-                return Ok(EXIT_AUTH_REQUIRED);
-            }
-        }
-    }
     let providers = if args.source == SourceSelection::Tg {
         Vec::new()
     } else {
+        let store = StateStore::from_paths(paths)?;
+        let mut available = builtin_stateless_providers();
+        available.extend(configured_stateful(&store, &config, &client_options)?);
+        let explicit = !args.providers.is_empty();
+        let selected_names: HashSet<_> = if !explicit {
+            let mut names = config
+                .search
+                .providers
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            for name in ["qqpd", "weibo", "gying", "panlian"] {
+                if !store.list_profiles(name)?.is_empty() {
+                    names.insert(name);
+                }
+            }
+            names
+        } else {
+            args.providers.iter().map(String::as_str).collect()
+        };
+        let known = available
+            .iter()
+            .map(|provider| provider.meta().name)
+            .chain(["qqpd", "weibo", "gying", "panlian"])
+            .collect::<HashSet<_>>();
+        if let Some(name) = selected_names.iter().find(|name| !known.contains(**name)) {
+            return Err(usage(format!("unknown provider: {name}")));
+        }
+        if explicit {
+            for name in ["qqpd", "weibo", "gying", "panlian"] {
+                if selected_names.contains(name) && !stateful_ready(&store, name)? {
+                    eprintln!("provider {name} requires login");
+                    return Ok(EXIT_AUTH_REQUIRED);
+                }
+            }
+        }
         available
             .into_iter()
             .filter(|provider| selected_names.contains(provider.meta().name))
@@ -381,114 +538,64 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
     let channels = if args.source == SourceSelection::Provider {
         Vec::new()
     } else {
-        config.search.channels.clone()
+        crate::channel::validate_search_channels(&config.search.channels)
+            .map_err(|error| usage(error.to_string()))?
     };
     if providers.is_empty() && channels.is_empty() {
         return Err(usage("no search sources selected"));
     }
+    if !args.quiet {
+        eprintln!(
+            "{}",
+            search_defaults_text(
+                providers.len(),
+                channels.len(),
+                config.search.jobs,
+                timeout.as_secs(),
+                config.search.all_timeout_secs
+            )
+        );
+    }
     let context = SearchContext::new(http.clone(), timeout);
-    let mut outcome = SearchEngine::new(context)
-        .search(SearchOptions {
-            query: args.query,
-            providers,
-            channels,
-            include: args.include,
-            exclude: args.exclude,
-            clouds: args.clouds,
-            jobs: config.search.jobs,
-            timeout,
-        })
-        .await;
-
-    if args.check || args.valid_only {
+    let engine = SearchEngine::new(context);
+    let options = SearchOptions {
+        query: args.query,
+        providers,
+        channels,
+        include: args.include,
+        exclude: args.exclude,
+        clouds: args.clouds,
+        jobs: config.search.jobs,
+        timeout,
+        all_timeout: Duration::from_secs(config.search.all_timeout_secs),
+    };
+    let checker = if args.check || args.valid_only {
         let cache = if config.check.enabled_cache {
             paths.ensure_dirs()?;
             Some(CheckCache::open(&paths.check_cache)?)
         } else {
             None
         };
-        let checker = CheckEngine::new(http, cache);
-        let links = outcome
-            .links_by_type
-            .values()
-            .flat_map(|links| links.iter())
-            .map(|link| {
-                let mut item = CheckItem::detect(link.url.clone());
-                item.password = link.password.clone();
-                item
-            })
-            .collect();
-        let checked = checker
-            .check(
-                links,
-                CheckOptions {
-                    jobs: config.check.jobs,
-                    timeout,
-                    refresh: false,
-                    no_cache: !config.check.enabled_cache,
-                    proxy_scope: proxy.as_deref().map(proxy_scope),
-                },
-            )
-            .await;
-        let mut by_url = std::collections::HashMap::new();
-        for result in checked {
-            by_url.insert(result.url.clone(), result);
-        }
-        for links in outcome.links_by_type.values_mut() {
-            for link in links.iter_mut() {
-                if let Some(value) = by_url.get(&link.url) {
-                    link.check = Some(crate::core::CheckResult {
-                        state: match value.state {
-                            CheckState::Ok => crate::core::CheckState::Ok,
-                            CheckState::Bad => crate::core::CheckState::Bad,
-                            CheckState::Locked => crate::core::CheckState::Locked,
-                            CheckState::Unsupported => crate::core::CheckState::Unsupported,
-                            CheckState::Uncertain => crate::core::CheckState::Uncertain,
-                        },
-                        cache_hit: value.cache_hit,
-                        checked_at: None,
-                        expires_at: None,
-                        summary: value.summary.clone(),
-                    });
-                }
-            }
-            if args.valid_only {
-                links.retain(|link| {
-                    link.check
-                        .as_ref()
-                        .is_some_and(|check| check.state == crate::core::CheckState::Ok)
-                });
-            }
-        }
-        outcome.links_by_type.retain(|_, links| !links.is_empty());
-        outcome.total_links = outcome.links_by_type.values().map(Vec::len).sum();
-        if args.valid_only {
-            let valid_urls = outcome
-                .links_by_type
-                .values()
-                .flatten()
-                .map(|link| crate::core::canonical_url_key(&link.url))
-                .collect::<HashSet<_>>();
-            outcome.results.retain_mut(|result| {
-                result
-                    .links
-                    .retain(|link| valid_urls.contains(&crate::core::canonical_url_key(&link.url)));
-                !result.links.is_empty()
-            });
-            outcome.total_results = outcome.results.len();
-        }
-    }
-    for error in &outcome.source_errors {
-        if !args.quiet {
-            eprintln!("{}: {}", error.source, error.message);
-        }
-    }
-    write_search(stdout(), &outcome, args.format)?;
-    Ok(if outcome.successful_sources == 0 {
-        EXIT_SEARCH_FAILED
+        Some(Arc::new(CheckEngine::new(http, cache)))
     } else {
-        EXIT_OK
-    })
+        None
+    };
+    streaming::run(
+        engine,
+        options,
+        checker,
+        CheckOptions {
+            jobs: config.check.jobs,
+            timeout,
+            refresh: false,
+            no_cache: !config.check.enabled_cache,
+            proxy_scope: proxy.as_deref().map(proxy_scope),
+        },
+        args.format,
+        args.valid_only,
+        args.quiet,
+    )
+    .await
 }
 
 fn init_logging(verbose: bool, quiet: bool) {
@@ -876,7 +983,19 @@ fn profile_status(
 
 fn save_config(paths: &AppPaths, config: &Config) -> anyhow::Result<()> {
     paths.ensure_dirs()?;
-    let contents = toml::to_string_pretty(config)?;
+    let mut saved = toml::Value::try_from(config)?;
+    // Provider configuration must not silently delete the deprecated field.
+    if paths.config_file.exists() {
+        let original: toml::Value = toml::from_str(&std::fs::read_to_string(&paths.config_file)?)?;
+        if let Some(channels) = original.get("search").and_then(|s| s.get("channels")) {
+            saved
+                .get_mut("search")
+                .and_then(toml::Value::as_table_mut)
+                .expect("serialized config contains search table")
+                .insert("channels".into(), channels.clone());
+        }
+    }
+    let contents = toml::to_string_pretty(&saved)?;
     let mut temporary = tempfile::NamedTempFile::new_in(&paths.config_dir)?;
     temporary.write_all(contents.as_bytes())?;
     temporary.as_file_mut().sync_all()?;

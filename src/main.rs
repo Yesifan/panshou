@@ -5,7 +5,18 @@ use pansou::cli::{Cli, error_exit_code};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let help = error.kind() == clap::error::ErrorKind::DisplayHelp;
+            let code = error.exit_code();
+            let _ = error.print();
+            if help {
+                println!("\n{}", pansou::cli::help_defaults());
+            }
+            return ExitCode::from(code as u8);
+        }
+    };
     match pansou::cli::run(cli).await {
         Ok(code) => ExitCode::from(code as u8),
         Err(error) => {
