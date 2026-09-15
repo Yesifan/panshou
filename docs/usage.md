@@ -93,9 +93,12 @@ pansou channel add @foo https://t.me/bar
 pansou channel add baz --disabled
 pansou channel enable foo bar
 pansou channel disable foo bar
+pansou channel enable --all
+pansou channel disable --all
 pansou channel remove foo bar
 pansou channel catalog
 pansou channel import --builtin
+pansou channel import --builtin --disable
 pansou channel import ./channels.txt
 pansou channel import https://example.com/channels.txt
 ```
@@ -104,10 +107,17 @@ pansou channel import https://example.com/channels.txt
 不接受私有邀请链接。添加默认启用；已存在的条目保留原状态。最多同时启用 128 个频道，
 可保存更多禁用频道；批量操作超限时不会只应用一部分。
 
-导入只新增缺失频道，新增项默认禁用。输入为 UTF-8 文本，每行一个名称或频道 URL，
+导入只新增缺失频道，新增项默认启用，`--disable` 可改为禁用；已有频道保留原状态。
+`enable --all` 和 `disable --all` 分别启用、禁用所有已保存频道，不能与频道名称混用。
+导入或全部启用超过 128 上限时整次拒绝，不部分修改；可先禁用部分频道或使用 `--disable` 导入。
+输入为 UTF-8 文本，每行一个名称或频道 URL，
 支持空行和 `#` 开头的整行注释。非法条目会报告行号并使整次导入失败。
 `catalog` 是当前安装版本内置的候选清单，不代表所有频道均经过在线验证；升级不会自动
 导入清单或恢复已删除频道。
+
+CLI 帮助统一使用英语，各级子命令和选项均提供用途说明。若已保存的频道尚未包含完整
+内置清单，帮助末尾会提示 `pansou channel import --builtin`，并说明新增项默认启用、
+可用 `--disable` 仅保存。该提示只检查当前清单，不记录历史导入状态，也不会自动修改频道配置。
 
 持久化频道统一保存在 `pansou channel path` 指向的 `channels.toml`：
 

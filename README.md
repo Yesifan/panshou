@@ -31,7 +31,7 @@ pansou search "仙逆" --provider meitizy --provider pansearch
 # 检测分享链接
 pansou check https://pan.quark.cn/s/xxxx
 
-# 管理频道；导入的新频道默认禁用
+# 管理频道；导入的新频道默认启用，可用 --disable 仅保存
 pansou channel add @foo https://t.me/bar
 pansou channel import --builtin
 pansou channel list

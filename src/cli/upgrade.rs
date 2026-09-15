@@ -3,10 +3,10 @@ use crate::update::{InstallOutcome, UpdateClient};
 
 #[derive(Debug, Args)]
 pub struct UpdateArgs {
-    /// Only check the target release; do not download or install it.
+    /// Check GitHub for the target release without downloading or installing it.
     #[arg(long)]
     pub check: bool,
-    /// Select a specific GitHub Release tag.
+    /// Select a GitHub Release tag (for example, v0.2.0); defaults to the latest stable release.
     #[arg(long)]
     pub version: Option<String>,
 }

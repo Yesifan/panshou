@@ -71,6 +71,85 @@ impl Fixture {
 }
 
 #[test]
+fn help_suggests_missing_builtin_candidates_without_changing_saved_choices() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["--help"]);
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(help.status.success());
+    assert!(text.contains("pansou channel import --builtin"));
+    assert!(text.contains("New entries are enabled by default"));
+    assert!(!fixture.channels().exists());
+    assert!(
+        fixture
+            .run(&["channel", "import", "--builtin"])
+            .status
+            .success()
+    );
+    let saved = fs::read(fixture.channels()).unwrap();
+    let help = fixture.run(&["search", "--help"]);
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(!text.contains("Expand Telegram sources"));
+    assert_eq!(fs::read(fixture.channels()).unwrap(), saved);
+}
+
+#[test]
+fn import_defaults_to_enabled_and_bulk_actions_preserve_entries() {
+    let fixture = Fixture::new();
+    let input = fixture.root.path().join("channels.txt");
+    fs::write(&input, "foo\nbar\n").unwrap();
+    let source = input.to_str().unwrap();
+    assert!(fixture.run(&["channel", "import", source]).status.success());
+    let store = pansou::channel::ChannelStore::new(fixture.channels());
+    assert_eq!(store.load().unwrap().enabled_names().len(), 3);
+    assert!(
+        fixture
+            .run(&["channel", "disable", "--all"])
+            .status
+            .success()
+    );
+    assert!(store.load().unwrap().enabled_names().is_empty());
+    assert!(fixture.run(&["channel", "import", source]).status.success());
+    assert!(
+        store.load().unwrap().enabled_names().is_empty(),
+        "reimport must preserve existing states"
+    );
+    fs::write(&input, "baz\n").unwrap();
+    assert!(
+        fixture
+            .run(&["channel", "import", source, "--disable"])
+            .status
+            .success()
+    );
+    assert!(store.load().unwrap().enabled_names().is_empty());
+    assert!(
+        fixture
+            .run(&["channel", "enable", "--all"])
+            .status
+            .success()
+    );
+    assert_eq!(store.load().unwrap().enabled_names().len(), 4);
+}
+
+#[test]
+fn builtin_import_can_start_enabled_or_disabled() {
+    for disable in [false, true] {
+        let fixture = Fixture::new();
+        let mut args = vec!["channel", "import", "--builtin"];
+        if disable {
+            args.push("--disable");
+        }
+        assert!(fixture.run(&args).status.success());
+        let list = pansou::channel::ChannelStore::new(fixture.channels())
+            .load()
+            .unwrap();
+        assert_eq!(
+            list.enabled_names().len(),
+            if disable { 1 } else { list.channels.len() }
+        );
+    }
+}
+
+#[test]
 fn independent_channels_ignore_old_config_and_keep_temporary_overrides_temporary() {
     let fixture = Fixture::new();
     fs::write(
@@ -134,7 +213,7 @@ fn help_reports_configured_budget_without_writing_and_survives_bad_config() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("Providers: 15"));
     assert!(text.contains("~540s"));
-    assert!(text.contains("关键词过长"));
+    assert!(text.contains("longer queries may reduce search quality"));
     assert_eq!(fs::read_to_string(fixture.channels()).unwrap(), content);
     assert!(!fixture.channels().with_extension("lock").exists());
     fs::write(&fixture.config, "invalid = [").unwrap();

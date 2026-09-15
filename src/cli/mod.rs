@@ -40,7 +40,7 @@ pub const EXIT_INVALID_LINK: i32 = 10;
 pub const EXIT_DEADLINE: i32 = 124;
 pub const EXIT_INTERRUPTED: i32 = 130;
 
-const SEARCH_GUIDANCE: &str = "搜索来源中的资源命名可能不规范。建议使用简短的核心关键词，关键词过长可能降低搜索效果。\nResults stream as sources finish. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
+const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources. Use short, focused keywords; longer queries may reduce search quality.\nResults stream as sources finish. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -83,20 +83,22 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Search Telegram channels and providers, streaming results as they arrive.
     Search(SearchArgs),
+    /// Validate cloud-drive links and report their availability.
     Check(CheckArgs),
+    /// Manage search providers, login sessions, and profiles.
     Provider(ProviderArgs),
+    /// Show the effective configuration or its file path.
     Config(ConfigArgs),
+    /// Manage Telegram channels and import candidate channel lists.
     Channel(channel::ChannelArgs),
+    /// Check GitHub Releases and install a verified update.
     Update(upgrade::UpdateArgs),
     #[command(name = "__update-preflight", hide = true)]
-    UpdatePreflight {
-        config_dir: std::path::PathBuf,
-    },
+    UpdatePreflight { config_dir: std::path::PathBuf },
     #[command(name = "__update-finish", hide = true)]
-    UpdateFinish {
-        config_dir: std::path::PathBuf,
-    },
+    UpdateFinish { config_dir: std::path::PathBuf },
     #[command(name = "__update-replace", hide = true)]
     UpdateReplace {
         staged: std::path::PathBuf,
@@ -115,17 +117,24 @@ pub enum SourceSelection {
 #[derive(Debug, Args)]
 #[command(after_help = SEARCH_GUIDANCE)]
 pub struct SearchArgs {
+    /// Short keywords to search for.
     pub query: String,
+    /// Select Telegram, providers, or both.
     #[arg(long, value_enum, default_value_t = SourceSelection::All)]
     pub source: SourceSelection,
+    /// Select a provider; repeat to select multiple providers.
     #[arg(long = "provider")]
     pub providers: Vec<String>,
+    /// Override saved Telegram channels for this search; repeat as needed.
     #[arg(long = "channel")]
     pub channels: Vec<String>,
+    /// Keep only this cloud-drive type; repeat as needed.
     #[arg(long = "cloud")]
     pub clouds: Vec<CloudType>,
+    /// Require an additional keyword in results; repeat as needed.
     #[arg(long = "include")]
     pub include: Vec<String>,
+    /// Exclude results containing this keyword; repeat as needed.
     #[arg(long = "exclude")]
     pub exclude: Vec<String>,
     #[arg(long, help = "Shared source concurrency (default: 8)")]
@@ -140,41 +149,57 @@ pub struct SearchArgs {
         help = "Search deadline in seconds, including queueing (default: 600)"
     )]
     pub all_timeout: Option<u64>,
+    /// Override the configured proxy URL.
     #[arg(long)]
     pub proxy: Option<String>,
     #[arg(long, value_parser = parse_search_format, default_value = "table", help = "Streaming output: table or jsonl")]
     pub format: OutputFormat,
+    /// Check discovered links for availability.
     #[arg(long)]
     pub check: bool,
+    /// Check links and show only valid results.
     #[arg(long)]
     pub valid_only: bool,
+    /// Show detailed progress and diagnostics.
     #[arg(long, conflicts_with = "quiet")]
     pub verbose: bool,
+    /// Suppress progress messages.
     #[arg(long, conflicts_with = "verbose")]
     pub quiet: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct CheckArgs {
+    /// Cloud-drive URLs to validate.
     pub urls: Vec<String>,
+    /// Read URLs from standard input, one per line.
     #[arg(long)]
     pub stdin: bool,
+    /// Override the detected cloud-drive type.
     #[arg(long = "type")]
     pub cloud_type: Option<String>,
+    /// Share extraction code (not an account password).
     #[arg(long)]
     pub password: Option<String>,
+    /// Maximum concurrent link checks.
     #[arg(long)]
     pub jobs: Option<usize>,
+    /// Timeout per link check, in seconds.
     #[arg(long)]
     pub timeout: Option<u64>,
+    /// Override the configured proxy URL.
     #[arg(long)]
     pub proxy: Option<String>,
+    /// Recheck links instead of using cached results.
     #[arg(long)]
     pub refresh: bool,
+    /// Disable reading and writing the check cache.
     #[arg(long)]
     pub no_cache: bool,
+    /// Select the output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+    /// Exit with a nonzero status if any link is invalid.
     #[arg(long)]
     pub fail_invalid: bool,
 }
@@ -187,52 +212,76 @@ pub struct ProviderArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ProviderCommand {
+    /// List available providers and their readiness.
     List,
+    /// List saved profiles for a provider.
     Profiles {
+        /// Provider name.
         name: String,
     },
+    /// Authenticate a provider and save its session.
     Login(LoginArgs),
+    /// Remove a saved provider session.
     Logout {
+        /// Provider name.
         name: String,
+        /// Saved profile to log out.
         #[arg(long, default_value = "main")]
         profile: String,
     },
+    /// Show authentication status for a provider or profile.
     Status {
+        /// Provider name.
         name: String,
+        /// Limit status to one saved profile.
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Configure provider-specific sources and settings.
     Configure(ConfigureArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
+    /// Provider name.
     pub name: String,
+    /// Profile name for the saved session.
     #[arg(long, default_value = "main")]
     pub profile: String,
+    /// Account username, when required by the provider.
     #[arg(long)]
     pub username: Option<String>,
+    /// Read the account password from standard input instead of prompting.
     #[arg(long)]
     pub password_stdin: bool,
+    /// Remember credentials for providers that support automatic login.
     #[arg(long)]
     pub remember_credentials: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct ConfigureArgs {
+    /// Provider name.
     pub name: String,
+    /// Profile to configure.
     #[arg(long, default_value = "main")]
     pub profile: String,
+    /// Comma-separated provider-specific channel identifiers.
     #[arg(long, value_delimiter = ',')]
     pub channels: Vec<String>,
+    /// Provider-specific channel identifier; repeat as needed.
     #[arg(long = "channel")]
     pub channel: Vec<String>,
+    /// Comma-separated provider-specific user identifiers.
     #[arg(long, value_delimiter = ',')]
     pub users: Vec<String>,
+    /// Provider-specific user identifier; repeat as needed.
     #[arg(long = "user")]
     pub user: Vec<String>,
+    /// Provider base URL.
     #[arg(long)]
     pub base_url: Option<String>,
+    /// Cloud-drive type to block for this provider; repeat as needed.
     #[arg(long = "blocked-cloud")]
     pub blocked_clouds: Vec<String>,
 }
@@ -245,7 +294,9 @@ pub struct ConfigArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
+    /// Print the effective configuration.
     Show,
+    /// Print the configuration file path.
     Path,
 }
 
@@ -355,13 +406,25 @@ pub fn help_defaults() -> String {
             }
         }
         let channels = crate::channel::validate_search_channels(&config.search.channels)?.len();
-        Ok(search_defaults_text(
+        let mut text = search_defaults_text(
             providers,
             channels,
             config.search.jobs,
             config.network.timeout_secs,
             config.search.all_timeout_secs,
-        ))
+        );
+        // Inspect saved entries, not transient search overrides. Disabled entries
+        // still count as imported; no import-history metadata is needed.
+        if let Ok(saved) = crate::channel::ChannelStore::new(&paths.channels_file).load() {
+            let catalog = crate::channel::parse_catalog(crate::channel::BUILTIN_CATALOG)?;
+            if catalog
+                .iter()
+                .any(|name| !saved.channels.iter().any(|c| &c.name == name))
+            {
+                text.push_str("\nExpand Telegram sources with `pansou channel import --builtin`. Some built-in candidates are not in your saved list. New entries are enabled by default; use `--disable` to import them as disabled. Existing channels keep their saved status. Use `pansou channel enable --all` or `pansou channel disable --all` to change all saved channels.");
+            }
+        }
+        Ok(text)
     })();
     match summary {
         Ok(text) => text,

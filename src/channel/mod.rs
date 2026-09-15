@@ -295,8 +295,21 @@ impl ChannelStore {
         })
     }
 
-    pub fn import_text(&self, input: &str) -> Result<ChangeSummary, ChannelError> {
-        self.add(&parse_catalog(input)?, false)
+    pub fn set_all_enabled(&self, enabled: bool) -> Result<ChangeSummary, ChannelError> {
+        self.modify(enabled, |list| {
+            let mut summary = ChangeSummary::default();
+            for channel in &mut list.channels {
+                if channel.enabled != enabled {
+                    channel.enabled = enabled;
+                    summary.changed += 1;
+                }
+            }
+            Ok(summary)
+        })
+    }
+
+    pub fn import_text(&self, input: &str, enabled: bool) -> Result<ChangeSummary, ChannelError> {
+        self.add(&parse_catalog(input)?, enabled)
     }
 
     pub async fn import_source(
@@ -304,6 +317,7 @@ impl ChannelStore {
         source: &str,
         client: &reqwest::Client,
         timeout: Duration,
+        enabled: bool,
     ) -> Result<ChangeSummary, ChannelError> {
         let bytes = if source.contains("://") {
             let url =
@@ -344,7 +358,7 @@ impl ChannelStore {
         };
         let input = String::from_utf8(bytes)
             .map_err(|_| ChannelError::Import("list must be UTF-8 text".into()))?;
-        self.import_text(&input)
+        self.import_text(&input, enabled)
     }
 }
 
@@ -435,21 +449,86 @@ mod tests {
     }
 
     #[test]
-    fn imports_are_atomic_idempotent_and_disabled() {
+    fn imports_are_atomic_idempotent_and_preserve_existing_states() {
         let dir = tempfile::tempdir().unwrap();
         let store = ChannelStore::new(dir.path().join("channels.toml"));
         let summary = store
-            .import_text("# comment\n\nFoo\n@foo\nhttps://t.me/bar\n")
+            .import_text("# comment\n\nFoo\n@foo\nhttps://t.me/bar\n", true)
             .unwrap();
         assert_eq!(summary.added, 2);
-        assert_eq!(store.load().unwrap().enabled_names(), ["tgsearchers3"]);
-        assert_eq!(store.import_text("foo\nbar").unwrap().existing, 2);
+        assert_eq!(
+            store.load().unwrap().enabled_names(),
+            ["tgsearchers3", "foo", "bar"]
+        );
+        assert_eq!(
+            store.import_text("foo\nbar\nbaz", false).unwrap().existing,
+            2
+        );
+        assert_eq!(store.import_text("baz", true).unwrap().existing, 1);
+        assert_eq!(
+            store.load().unwrap().enabled_names(),
+            ["tgsearchers3", "foo", "bar"]
+        );
         assert!(matches!(
-            store.import_text("baz\ninvalid value"),
+            store.import_text("qux\ninvalid value", true),
             Err(ChannelError::ImportLine { line: 2, .. })
         ));
-        assert_eq!(store.load().unwrap().channels.len(), 3);
+        assert_eq!(store.load().unwrap().channels.len(), 4);
         assert_eq!(parse_catalog(BUILTIN_CATALOG).unwrap().len(), 110);
+    }
+
+    #[test]
+    fn enabled_import_and_enable_all_enforce_limit_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChannelStore::new(dir.path().join("channels.toml"));
+        store.add(&names(&["foo"]), false).unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let catalog = (0..MAX_ENABLED_CHANNELS)
+            .map(|i| format!("channel{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(
+            store.import_text(&catalog, true),
+            Err(ChannelError::Limit(129))
+        ));
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+
+        store.import_text(&catalog, false).unwrap();
+        let before = fs::read(store.path()).unwrap();
+        assert!(matches!(
+            store.set_all_enabled(true),
+            Err(ChannelError::Limit(130))
+        ));
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+        store.remove(&names(&["foo", "channel0"])).unwrap();
+        assert_eq!(store.set_all_enabled(true).unwrap().changed, 127);
+        assert_eq!(
+            store.load().unwrap().enabled_names().len(),
+            MAX_ENABLED_CHANNELS
+        );
+        assert_eq!(store.set_all_enabled(true).unwrap().changed, 0);
+    }
+
+    #[test]
+    fn disable_all_repairs_over_limit_and_preserves_empty_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChannelStore::new(dir.path().join("channels.toml"));
+        let list = ChannelList {
+            version: 1,
+            channels: (0..130)
+                .map(|i| Channel {
+                    name: format!("channel{i}"),
+                    enabled: true,
+                })
+                .collect(),
+        };
+        fs::write(store.path(), toml::to_string(&list).unwrap()).unwrap();
+        assert_eq!(store.set_all_enabled(false).unwrap().changed, 130);
+        assert!(store.load().unwrap().enabled_names().is_empty());
+        assert_eq!(store.set_all_enabled(false).unwrap().changed, 0);
+        store.remove(&list.enabled_names()).unwrap();
+        assert_eq!(store.set_all_enabled(true).unwrap().changed, 0);
+        assert!(store.load().unwrap().channels.is_empty());
     }
 
     #[test]
@@ -492,17 +571,26 @@ mod tests {
         let timeout = Duration::from_secs(2);
         assert_eq!(
             store
-                .import_source(&format!("{}/good", server.uri()), &client, timeout)
+                .import_source(&format!("{}/good", server.uri()), &client, timeout, true)
                 .await
                 .unwrap()
                 .added,
             2
         );
+        assert_eq!(
+            store.load().unwrap().enabled_names(),
+            ["tgsearchers3", "foo", "bar"]
+        );
         let before = fs::read(store.path()).unwrap();
         for endpoint in ["failure", "large"] {
             assert!(
                 store
-                    .import_source(&format!("{}/{endpoint}", server.uri()), &client, timeout)
+                    .import_source(
+                        &format!("{}/{endpoint}", server.uri()),
+                        &client,
+                        timeout,
+                        true
+                    )
                     .await
                     .is_err()
             );
@@ -512,11 +600,15 @@ mod tests {
         fs::write(&file, "baz").unwrap();
         assert_eq!(
             store
-                .import_source(file.to_str().unwrap(), &client, timeout)
+                .import_source(file.to_str().unwrap(), &client, timeout, false)
                 .await
                 .unwrap()
                 .added,
             1
+        );
+        assert_eq!(
+            store.load().unwrap().enabled_names(),
+            ["tgsearchers3", "foo", "bar"]
         );
     }
 

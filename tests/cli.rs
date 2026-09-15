@@ -3,6 +3,26 @@ use pansou::cli::{Cli, Command, ProviderCommand, SourceSelection};
 use pansou::output::OutputFormat;
 
 #[test]
+fn visible_commands_have_english_descriptions() {
+    use clap::CommandFactory;
+    fn verify(command: &clap::Command) {
+        for child in command.get_subcommands().filter(|c| !c.is_hide_set()) {
+            let about = child
+                .get_about()
+                .expect("every command needs a description")
+                .to_string();
+            assert!(about.is_ascii(), "non-English command description: {about}");
+            verify(child);
+        }
+    }
+    let mut command = Cli::command();
+    verify(&command);
+    let help = command.render_long_help().to_string();
+    assert!(help.contains("Use short, focused keywords"));
+    assert!(help.is_ascii());
+}
+
+#[test]
 fn parses_search_contract_and_repeatable_filters() {
     let cli = Cli::try_parse_from([
         "pansou",
@@ -99,4 +119,20 @@ fn channel_import_and_update_arguments() {
     assert!(Cli::try_parse_from(["pansou", "channel", "import", "--builtin", "list.txt"]).is_err());
     assert!(Cli::try_parse_from(["pansou", "channel", "add", "@foo", "https://t.me/bar"]).is_ok());
     assert!(Cli::try_parse_from(["pansou", "update", "--check", "--version", "v0.2.0"]).is_ok());
+}
+
+#[test]
+fn channel_bulk_actions_require_names_or_all_and_import_accepts_disable() {
+    for action in ["enable", "disable"] {
+        assert!(Cli::try_parse_from(["pansou", "channel", action, "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["pansou", "channel", action]).is_err());
+        assert!(Cli::try_parse_from(["pansou", "channel", action, "--all", "foo"]).is_err());
+    }
+    for source in [
+        "--builtin",
+        "./channels.txt",
+        "https://example.com/channels.txt",
+    ] {
+        assert!(Cli::try_parse_from(["pansou", "channel", "import", source, "--disable"]).is_ok());
+    }
 }

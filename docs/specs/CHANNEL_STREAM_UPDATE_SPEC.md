@@ -26,9 +26,11 @@ pansou channel add NAME_OR_URL... [--disabled]
 pansou channel remove NAME...
 pansou channel enable NAME...
 pansou channel disable NAME...
+pansou channel enable --all
+pansou channel disable --all
 pansou channel catalog
-pansou channel import --builtin
-pansou channel import FILE_OR_URL
+pansou channel import --builtin [--disable]
+pansou channel import FILE_OR_URL [--disable]
 pansou channel path
 ```
 
@@ -98,7 +100,9 @@ pansou channel import https://example.com/channels.txt
 - 三种来源使用相同的 UTF-8 文本格式：每行一个频道名称或地址，允许空行及以 `#`
   开头的整行注释。
 - 内置导入与文件或 URL 参数互斥。
-- 新增频道默认禁用；已有频道保留原状态。
+- 新增频道默认启用，`--disable` 表示仅保存而不启用；已有频道保留原状态。
+- `enable --all` / `disable --all` 修改所有已保存频道，不能与名称同时提供。
+- 导入或全部启用超过 128 上限时整次拒绝，不留下部分修改。
 - 重复导入不产生重复记录。
 - 非法条目报告行号，整次导入不生效。
 - 远程导入支持 HTTP(S)，沿用网络和代理配置，并有请求超时及大小限制。
@@ -313,7 +317,8 @@ pansou update --version v0.2.0
 - [ ] 名称、`@名称`、公开 URL 和大小写变体只产生一个频道记录。
 - [ ] 启用第 129 个频道失败，原状态不变；禁用频道仍可继续保存。
 - [ ] 参数、环境变量及手工文件修改不能绕过单次 128 频道上限。
-- [ ] 三种导入来源行为一致，新增项禁用，已有状态不变。
+- [ ] 三种导入来源行为一致，新增项默认启用，`--disable` 新增为禁用，已有状态不变。
+- [ ] 启停支持 `--all`，全部启用超限时整次拒绝，全部禁用可修复超限配置。
 - [ ] 非法行报告位置；下载、解析或保存失败不留下部分修改。
 - [ ] 同时执行修改不会丢失已成功保存的频道。
 - [ ] 旧 `search.channels` 不影响搜索、不自动迁移，并产生针对性提示。
