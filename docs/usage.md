@@ -92,6 +92,7 @@ pansou channel list
 pansou channel path
 pansou channel add @foo https://t.me/bar
 pansou channel add baz --disabled
+pansou channel add trusted_name --no-validate
 pansou channel enable foo bar
 pansou channel disable foo bar
 pansou channel enable --all
@@ -105,7 +106,10 @@ pansou channel import https://example.com/channels.txt
 ```
 
 名称、`@名称`、`https://t.me/名称` 和 `https://t.me/s/名称` 统一规范化并去重。
-不接受私有邀请链接。添加默认启用；已存在的条目保留原状态。最多同时启用 128 个频道，
+`channel add` 默认联网确认目标具有公开用户名和 `https://t.me/s/<name>` 消息预览；
+bot、私有邀请、不存在或没有公开消息页的目标会被拒绝。网络失败、Telegram 限流
+或未知页面会报“无法确认”而不会冒充无效频道；`--no-validate` 可显式跳过联网校验。
+添加默认启用；已存在的条目保留原状态。最多同时启用 128 个频道，
 可保存更多禁用频道；批量操作超限时不会只应用一部分。
 
 导入只新增缺失频道，新增项默认启用，`--disable` 可改为禁用；已有频道保留原状态。
@@ -132,7 +136,10 @@ enabled = true
 
 文件不存在时使用初始默认频道 `tgsearchers3`；显式空清单或全部禁用表示不搜索任何默认频道。
 本次频道选择优先级为 `--channel` > `PANSOU_CHANNELS` > `CHANNELS` > 独立清单启用项。
-各层整体覆盖，不写回文件；本次显式选择去重后也不能超过 128。
+各层整体覆盖；本次显式选择去重后也不能超过 128。搜索过程确认某个已保存的启用频道
+是 bot、已删除或没有公开消息归档时，会自动将其设为 disabled 并在 stderr 提示。
+限流、超时、网络/Telegram 服务错误、未知页面和关键词无结果不会触发禁用；CLI 或
+环境变量临时选择且未保存的频道也不会写入清单。
 
 旧 `config.toml` 的 `search.channels` 已废弃，忽略其值且不自动迁移。
 看到提示后，请通过 `channel add` 或 `channel import` 重新设置，再删除旧字段。

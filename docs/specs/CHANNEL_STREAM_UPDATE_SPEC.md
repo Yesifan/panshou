@@ -22,7 +22,7 @@
 
 ```bash
 pansou channel list
-pansou channel add NAME_OR_URL... [--disabled]
+pansou channel add NAME_OR_URL... [--disabled] [--no-validate]
 pansou channel remove NAME...
 pansou channel enable NAME...
 pansou channel disable NAME...
@@ -45,6 +45,9 @@ pansou channel add @foo https://t.me/bar
 - 接受公开频道名称、`@名称`、`https://t.me/名称` 和 `https://t.me/s/名称`。
 - 同一频道的不同输入形式及大小写不产生重复记录。
 - 拒绝空名称、非法名称、私有邀请链接和非 Telegram 频道地址。
+- 默认联网校验公开 `t.me/s/<name>` 消息页，拒绝 bot、不存在或无公开消息
+  归档的目标；网络、限流或未知页面错误应明确表示无法确认。
+- `--no-validate` 可跳过在线校验；`channel add --help` 应说明支持的频道类型。
 - 添加频道默认启用，`--disabled` 表示仅保存而不启用。
 - 添加已存在的频道保留其启用状态；重复启用或禁用不改变结果。
 - 启用或禁用不存在的频道报错；删除不存在的频道报告未找到。
@@ -68,6 +71,8 @@ pansou channel add @foo https://t.me/bar
 - 新频道文件不存在时保留当前初始默认频道 `tgsearchers3`；显式保存的空清单或
   全部禁用的清单不能恢复默认频道。
 - 普通搜索和软件升级不自动导入候选清单，不恢复用户删除的频道。
+- 搜索中确认 bot、404/410 或无公开消息归档时，一次性禁用已保存的对应频道并
+  提示用户；临时来源、空结果及暂时性错误不写入频道文件。
 - 保存失败不损坏原有清单；同时执行管理命令不能丢失已成功保存的修改。
 
 本次搜索的频道选择优先级从高到低为：

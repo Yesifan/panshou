@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use scraper::{Html, Selector};
 use url::Url;
 
+use crate::channel::{ChannelPageKind, classify_channel_page};
 use crate::core::{
     Link, ProviderError, SearchResult, Source, associate_work_titles, canonical_url_key,
     extract_links, extract_password,
@@ -46,6 +47,15 @@ impl TelegramSource {
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(ProviderError::RateLimited);
         }
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+        ) {
+            return Err(ProviderError::InvalidSource(format!(
+                "Telegram returned HTTP {}",
+                response.status()
+            )));
+        }
         if !response.status().is_success() {
             return Err(ProviderError::Unavailable(format!(
                 "HTTP {}",
@@ -56,6 +66,19 @@ impl TelegramSource {
             .text()
             .await
             .map_err(|error| ProviderError::Network(error.to_string()))?;
+        match classify_channel_page(&body, &channel) {
+            ChannelPageKind::Bot => {
+                return Err(ProviderError::InvalidSource(
+                    "it is a bot, not a public channel".into(),
+                ));
+            }
+            ChannelPageKind::NoPublicMessages => {
+                return Err(ProviderError::InvalidSource(
+                    "it has no public /s/<name> message archive".into(),
+                ));
+            }
+            ChannelPageKind::PublicMessages | ChannelPageKind::Unknown => {}
+        }
         parse_telegram(&body, &channel)
     }
 }
@@ -194,6 +217,10 @@ fn selector(value: &str) -> Result<Selector, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
 
     #[test]
     fn parses_message_and_ignores_linkless_message() {
@@ -250,5 +277,49 @@ mod tests {
         ] {
             assert!(parse_telegram(html, "demo").unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn search_distinguishes_invalid_transient_and_empty_channels() {
+        let server = MockServer::start().await;
+        for (name, response) in [
+            ("missing", ResponseTemplate::new(404)),
+            (
+                "bot",
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<div class="tgme_page_wrap">20 monthly users <a>Start Bot</a></div>"#,
+                ),
+            ),
+            ("busy", ResponseTemplate::new(503)),
+            (
+                "empty",
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<div class="tgme_channel_info"></div><div class="tme_no_messages_found">No posts found</div>"#,
+                ),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/s/{name}")))
+                .and(query_param("q", "needle"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+        }
+        let source = TelegramSource::with_base_url(
+            reqwest::Client::new(),
+            Url::parse(&format!("{}/", server.uri())).unwrap(),
+        );
+
+        for name in ["missing", "bot"] {
+            assert!(matches!(
+                source.search(name, "needle").await,
+                Err(ProviderError::InvalidSource(_))
+            ));
+        }
+        assert!(matches!(
+            source.search("busy", "needle").await,
+            Err(ProviderError::Unavailable(_))
+        ));
+        assert!(source.search("empty", "needle").await.unwrap().is_empty());
     }
 }

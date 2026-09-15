@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    ffi::OsString,
     io::{self, BufRead, Read, Write},
     path::Path,
     process::Command as ProcessCommand,
@@ -240,8 +241,8 @@ pub enum ProviderCommand {
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Provider name.
-    pub name: String,
+    /// Provider name. See the possible values below for its login method.
+    pub name: LoginProviderName,
     /// Profile name for the saved session.
     #[arg(long, default_value = "main")]
     pub profile: String,
@@ -254,6 +255,42 @@ pub struct LoginArgs {
     /// Remember credentials for providers that support automatic login.
     #[arg(long)]
     pub remember_credentials: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum LoginProviderName {
+    /// QR code login; scan with QQ. No username or password options are needed.
+    Qqpd,
+    /// QR code login; scan with Weibo. No username or password options are needed.
+    Weibo,
+    /// Username/password login; requires --username. The password is prompted unless --password-stdin is used; --remember-credentials is optional.
+    Gying,
+    /// Username/password login; requires --username. The password is prompted unless --password-stdin is used; --remember-credentials is optional.
+    Panlian,
+}
+
+impl LoginProviderName {
+    const ALL: [Self; 4] = [Self::Qqpd, Self::Weibo, Self::Gying, Self::Panlian];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Qqpd => "qqpd",
+            Self::Weibo => "weibo",
+            Self::Gying => "gying",
+            Self::Panlian => "panlian",
+        }
+    }
+
+    const fn supports_remembered_credentials(self) -> bool {
+        matches!(self, Self::Gying | Self::Panlian)
+    }
+
+    const fn auth_label(self) -> &'static str {
+        match self {
+            Self::Qqpd | Self::Weibo => "qr",
+            Self::Gying | Self::Panlian => "password",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -397,7 +434,7 @@ pub fn help_defaults() -> String {
                     .any(|name| name == provider.meta().name)
             })
             .count();
-        for name in ["qqpd", "weibo", "gying", "panlian"] {
+        for name in LoginProviderName::ALL.map(LoginProviderName::as_str) {
             if stateful_ready(&store, name)? {
                 providers += 1;
             }
@@ -427,6 +464,15 @@ pub fn help_defaults() -> String {
         Ok(text) => text,
         Err(error) => format!("Current search defaults: unavailable ({error})."),
     }
+}
+
+/// Whether dynamic search defaults belong with this top-level invocation.
+///
+/// `args` excludes the executable name. Subcommand help must stay static and
+/// focused on that subcommand.
+pub fn is_root_help_request(args: &[OsString]) -> bool {
+    args.is_empty()
+        || (args.len() == 1 && matches!(args[0].to_str(), Some("help" | "-h" | "--help")))
 }
 
 fn search_defaults_text(
@@ -565,7 +611,7 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
                 .iter()
                 .map(String::as_str)
                 .collect::<HashSet<_>>();
-            for name in ["qqpd", "weibo", "gying", "panlian"] {
+            for name in LoginProviderName::ALL.map(LoginProviderName::as_str) {
                 if !store.list_profiles(name)?.is_empty() {
                     names.insert(name);
                 }
@@ -577,13 +623,13 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
         let known = available
             .iter()
             .map(|provider| provider.meta().name)
-            .chain(["qqpd", "weibo", "gying", "panlian"])
+            .chain(LoginProviderName::ALL.map(LoginProviderName::as_str))
             .collect::<HashSet<_>>();
         if let Some(name) = selected_names.iter().find(|name| !known.contains(**name)) {
             return Err(usage(format!("unknown provider: {name}")));
         }
         if explicit {
-            for name in ["qqpd", "weibo", "gying", "panlian"] {
+            for name in LoginProviderName::ALL.map(LoginProviderName::as_str) {
                 if selected_names.contains(name) && !stateful_ready(&store, name)? {
                     eprintln!("provider {name} requires login");
                     return Ok(EXIT_AUTH_REQUIRED);
@@ -654,6 +700,7 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
         args.format,
         !args.no_check,
         args.quiet,
+        crate::channel::ChannelStore::new(paths.channels_file.clone()),
     )
     .await
 }
@@ -747,12 +794,9 @@ async fn run_provider(
             for provider in builtin_stateless_providers() {
                 println!("{:<12} {:<9} yes", provider.meta().name, "no");
             }
-            for (name, auth) in [
-                ("qqpd", "qr"),
-                ("weibo", "qr"),
-                ("gying", "password"),
-                ("panlian", "password"),
-            ] {
+            for provider in LoginProviderName::ALL {
+                let name = provider.as_str();
+                let auth = provider.auth_label();
                 let count = store.list_profiles(name)?.len();
                 let is_ready = stateful_ready(&store, name)?;
                 let ready = if !is_ready {
@@ -785,17 +829,17 @@ async fn run_provider(
             }
         }
         ProviderCommand::Login(args) => {
-            require_stateful_name(&args.name)?;
-            let _ = store.profile_path(&args.name, &args.profile)?;
+            let name = args.name.as_str();
+            let _ = store.profile_path(name, &args.profile)?;
             if args.remember_credentials
-                && matches!(args.name.as_str(), "gying" | "panlian")
+                && args.name.supports_remembered_credentials()
                 && !store.encryption_enabled()
             {
                 return Err(usage("--remember-credentials requires PANSOU_STATE_KEY"));
             }
             let (_, _, _, mut options) = client(config, None, None)?;
-            match args.name.as_str() {
-                "qqpd" => {
+            match args.name {
+                LoginProviderName::Qqpd => {
                     let factory = HttpClientFactory::new();
                     let session = factory.session(&options)?;
                     let provider = QqpdProvider::new(store.clone());
@@ -839,7 +883,7 @@ async fn run_provider(
                         }
                     }
                 }
-                "weibo" => {
+                LoginProviderName::Weibo => {
                     options.redirect = RedirectPolicy::None;
                     let session = HttpClientFactory::new().session(&options)?;
                     let provider = WeiboProvider::new(store.clone());
@@ -878,7 +922,7 @@ async fn run_provider(
                         }
                     }
                 }
-                "gying" => {
+                LoginProviderName::Gying => {
                     let username = required_username(args.username.as_deref())?;
                     let password = read_password(args.password_stdin)?;
                     let provider = GyingProvider::load(
@@ -897,7 +941,7 @@ async fn run_provider(
                         .await?;
                     println!("gying/{}: logged in", args.profile);
                 }
-                "panlian" => {
+                LoginProviderName::Panlian => {
                     let username = required_username(args.username.as_deref())?;
                     let password = read_password(args.password_stdin)?;
                     let factory = HttpClientFactory::new();
@@ -922,7 +966,6 @@ async fn run_provider(
                         .await?;
                     println!("panlian/{}: logged in", args.profile);
                 }
-                _ => return Err(usage(format!("unknown provider: {}", args.name))),
             }
         }
         ProviderCommand::Configure(args) => {
@@ -981,7 +1024,10 @@ async fn run_provider(
 }
 
 fn require_stateful_name(name: &str) -> anyhow::Result<()> {
-    if ["qqpd", "weibo", "gying", "panlian"].contains(&name) {
+    if LoginProviderName::ALL
+        .into_iter()
+        .any(|provider| provider.as_str() == name)
+    {
         Ok(())
     } else {
         Err(usage(format!("unknown stateful provider: {name}")))

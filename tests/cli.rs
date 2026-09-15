@@ -1,6 +1,7 @@
 use clap::Parser;
 use pansou::cli::{Cli, Command, ProviderCommand, SourceSelection};
 use pansou::output::OutputFormat;
+use std::process::Command as ProcessCommand;
 
 #[test]
 fn visible_commands_have_english_descriptions() {
@@ -112,6 +113,53 @@ fn provider_password_is_never_a_command_line_argument() {
     .unwrap();
     assert!(matches!(cli.command, Command::Provider(args)
         if matches!(args.command, ProviderCommand::Login(ref login) if login.password_stdin)));
+}
+
+#[test]
+fn provider_login_help_lists_names_and_login_methods() {
+    let error = Cli::try_parse_from(["pansou", "provider", "login", "--help"]).unwrap_err();
+    let help = error.to_string();
+    for name in ["qqpd", "weibo", "gying", "panlian"] {
+        assert!(help.contains(name), "missing provider {name}: {help}");
+    }
+    assert!(help.contains("QR code login"));
+    assert!(help.contains("Username/password login"));
+    assert!(help.contains("requires --username"));
+    assert!(help.contains("--password-stdin"));
+}
+
+#[test]
+fn dynamic_search_defaults_only_appear_at_the_root() {
+    let binary = env!("CARGO_BIN_EXE_pansou");
+    for root_args in [vec!["help"], vec!["--help"], vec!["-h"], Vec::new()] {
+        let output = ProcessCommand::new(binary)
+            .args(root_args)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("Current search defaults:"), "{text}");
+    }
+
+    for subcommand_args in [
+        vec!["search", "--help"],
+        vec!["provider", "--help"],
+        vec!["provider", "login", "--help"],
+    ] {
+        let output = ProcessCommand::new(binary)
+            .args(subcommand_args)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!text.contains("Current search defaults:"), "{text}");
+    }
 }
 
 #[test]

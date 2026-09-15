@@ -10,6 +10,7 @@ use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered}
 use tokio::sync::{mpsc, watch};
 
 use crate::{
+    channel::ChannelStore,
     check::{CheckEngine, CheckItem, CheckOptions, CheckResult},
     core::{MergedLink, canonical_url_key},
     output::{OutputFormat, stdout, write_search_event},
@@ -18,6 +19,7 @@ use crate::{
 
 use super::{EXIT_DEADLINE, EXIT_INTERRUPTED, EXIT_OK, EXIT_SEARCH_FAILED};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     engine: SearchEngine,
     options: SearchOptions,
@@ -26,6 +28,7 @@ pub(super) async fn run(
     format: OutputFormat,
     require_ok: bool,
     quiet: bool,
+    channel_store: ChannelStore,
 ) -> anyhow::Result<i32> {
     drive(
         engine,
@@ -35,6 +38,7 @@ pub(super) async fn run(
         format,
         require_ok,
         quiet,
+        Some(channel_store),
         stdout(),
         tokio::signal::ctrl_c(),
     )
@@ -54,6 +58,7 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
     format: OutputFormat,
     require_ok: bool,
     quiet: bool,
+    channel_store: Option<ChannelStore>,
     mut writer: W,
     interrupt: F,
 ) -> anyhow::Result<i32> {
@@ -70,6 +75,7 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
     let mut scheduled = HashSet::new();
     let mut pending = VecDeque::<(String, String, CheckItem)>::new();
     let mut checks = FuturesUnordered::<CheckTask>::new();
+    let mut invalid_channels = HashSet::<String>::new();
 
     loop {
         if let Some(checker) = &checker {
@@ -125,6 +131,11 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
                     }
                     SearchEvent::Summary { .. } => {} // Final summary includes completed checks below.
                     SearchEvent::SourceError { ref error } => {
+                        if error.kind == "invalid_source"
+                            && let Some(channel) = error.source.strip_prefix("tg:")
+                        {
+                            invalid_channels.insert(channel.to_owned());
+                        }
                         if !quiet { eprintln!("{}: {}", error.source, error.message); }
                         write_search_event(&mut writer, &event, format)?;
                     }
@@ -139,6 +150,22 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
         }
     }
     let mut summary = summary.expect("search must complete before output loop ends");
+    if let Some(store) = channel_store.filter(|_| !invalid_channels.is_empty()) {
+        let mut names = invalid_channels.into_iter().collect::<Vec<_>>();
+        names.sort();
+        let changed = store.disable_existing(&names)?;
+        if !changed.changed_names.is_empty() {
+            eprintln!(
+                "Disabled invalid Telegram channel{}: {}",
+                if changed.changed_names.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                changed.changed_names.join(", ")
+            );
+        }
+    }
     summary.total_links = emitted.len();
     summary.duration_ms = started.elapsed().as_millis();
     if interrupted {
@@ -213,9 +240,11 @@ fn emit_link<W: Write>(
 mod tests {
     use super::*;
     use crate::{
+        channel::ChannelStore,
         check::{CheckCloudType, CheckContext, CheckError, CheckEvaluation, LinkChecker},
         core::{Link, MergedLink, ProviderError, SearchResult, Source},
         providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext},
+        search::TelegramSource,
     };
     use async_trait::async_trait;
     use std::{
@@ -224,6 +253,11 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
+    };
+    use url::Url;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
     };
 
     #[derive(Clone, Default)]
@@ -421,6 +455,7 @@ mod tests {
             OutputFormat::Jsonl,
             false,
             true,
+            None,
             buffer.clone(),
             futures::future::pending(),
         );
@@ -457,6 +492,7 @@ mod tests {
             OutputFormat::Jsonl,
             true,
             true,
+            None,
             buffer.clone(),
             futures::future::pending(),
         )
@@ -500,6 +536,7 @@ mod tests {
             OutputFormat::Jsonl,
             true,
             true,
+            None,
             buffer.clone(),
             futures::future::pending(),
         )
@@ -536,6 +573,7 @@ mod tests {
             OutputFormat::Jsonl,
             false,
             true,
+            None,
             buffer.clone(),
             interrupt,
         )
@@ -547,5 +585,91 @@ mod tests {
             buffer.events()[0]["summary"]["finish_reason"],
             "interrupted"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_saved_channels_are_disabled_but_other_sources_are_untouched() {
+        let server = MockServer::start().await;
+        for (name, response) in [
+            ("invalid", ResponseTemplate::new(404)),
+            ("temporary", ResponseTemplate::new(410)),
+            ("busy", ResponseTemplate::new(503)),
+            (
+                "empty",
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<div class="tgme_channel_info"></div><div class="tme_no_messages_found">No posts found</div>"#,
+                ),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/s/{name}")))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChannelStore::new(dir.path().join("channels.toml"));
+        store
+            .add(&["invalid".into(), "busy".into(), "empty".into()], true)
+            .unwrap();
+        let engine = SearchEngine::new(SearchContext::new(
+            reqwest::Client::new(),
+            Duration::from_secs(5),
+        ))
+        .with_telegram(TelegramSource::with_base_url(
+            reqwest::Client::new(),
+            Url::parse(&format!("{}/", server.uri())).unwrap(),
+        ));
+        let options = SearchOptions {
+            query: "needle".into(),
+            channels: vec![
+                "invalid".into(),
+                "temporary".into(),
+                "busy".into(),
+                "empty".into(),
+            ],
+            ..SearchOptions::default()
+        };
+
+        let code = drive(
+            engine,
+            options,
+            None,
+            CheckOptions::default(),
+            OutputFormat::Jsonl,
+            false,
+            true,
+            Some(store.clone()),
+            Vec::new(),
+            futures::future::pending(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, EXIT_OK);
+        let list = store.load().unwrap();
+        assert!(
+            !list
+                .channels
+                .iter()
+                .find(|c| c.name == "invalid")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            list.channels
+                .iter()
+                .find(|c| c.name == "busy")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            list.channels
+                .iter()
+                .find(|c| c.name == "empty")
+                .unwrap()
+                .enabled
+        );
+        assert!(!list.channels.iter().any(|c| c.name == "temporary"));
     }
 }

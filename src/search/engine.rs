@@ -404,6 +404,7 @@ fn source_error(source: String, error: ProviderError) -> SourceError {
         ProviderError::Blocked => "blocked",
         ProviderError::Protocol(_) => "protocol",
         ProviderError::Unavailable(_) => "unavailable",
+        ProviderError::InvalidSource(_) => "invalid_source",
     }
     .to_owned();
     SourceError {

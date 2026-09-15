@@ -11,7 +11,11 @@ pub struct ChannelArgs {
 pub enum ChannelCommand {
     /// List saved channels and their enabled status.
     List,
-    /// Add public channel names or URLs (enabled unless --disabled).
+    /// Add searchable public Telegram channels (enabled unless --disabled).
+    ///
+    /// Supported channels have a public username and a message preview at
+    /// https://t.me/s/<name>. Bots, private invite links, and names without a
+    /// public message page are not supported.
     Add {
         /// Public channel usernames, @usernames, or https://t.me/ URLs.
         #[arg(required = true, num_args = 1..)]
@@ -19,6 +23,9 @@ pub enum ChannelCommand {
         /// Save new channels without enabling them for searches.
         #[arg(long)]
         disabled: bool,
+        /// Skip checking that each name has a searchable public message page.
+        #[arg(long)]
+        no_validate: bool,
     },
     /// Remove saved channels from the custom channel list.
     Remove {
@@ -97,7 +104,22 @@ pub async fn run(args: ChannelArgs, paths: &AppPaths) -> anyhow::Result<i32> {
             println!("{}", store.path().display());
             return Ok(EXIT_OK);
         }
-        ChannelCommand::Add { names, disabled } => store.add(&names, !disabled)?,
+        ChannelCommand::Add {
+            names,
+            disabled,
+            no_validate,
+        } => {
+            let names = if no_validate {
+                crate::channel::normalize_channels(&names)?
+            } else {
+                let config = Config::load_network(&paths.config_file)?;
+                let (http, _, timeout, _) = client(&config, None, None)?;
+                crate::channel::ChannelValidator::new(http, timeout)
+                    .validate(&names)
+                    .await?
+            };
+            store.add(&names, !disabled)?
+        }
         ChannelCommand::Remove { names } => store.remove(&names)?,
         ChannelCommand::Enable { all: true, .. } => store.set_all_enabled(true)?,
         ChannelCommand::Disable { all: true, .. } => store.set_all_enabled(false)?,

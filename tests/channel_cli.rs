@@ -93,6 +93,18 @@ fn help_suggests_missing_builtin_candidates_without_changing_saved_choices() {
 }
 
 #[test]
+fn channel_add_help_describes_supported_sources_and_validation_escape_hatch() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["channel", "add", "--help"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("public username"));
+    assert!(text.contains("https://t.me/s/<name>"));
+    assert!(text.contains("Bots, private invite links"));
+    assert!(text.contains("--no-validate"));
+}
+
+#[test]
 fn import_defaults_to_enabled_and_bulk_actions_preserve_entries() {
     let fixture = Fixture::new();
     let input = fixture.root.path().join("channels.txt");
@@ -158,7 +170,14 @@ fn independent_channels_ignore_old_config_and_keep_temporary_overrides_temporary
     )
     .unwrap();
     fs::write(fixture.channels(), "version = 1\nchannels = []\n").unwrap();
-    let output = fixture.run(&["channel", "add", "@Foo", "https://t.me/foo", "bar"]);
+    let output = fixture.run(&[
+        "channel",
+        "add",
+        "@Foo",
+        "https://t.me/foo",
+        "bar",
+        "--no-validate",
+    ]);
     assert!(
         output.status.success(),
         "{}",

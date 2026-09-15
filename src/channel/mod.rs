@@ -8,8 +8,10 @@ use std::{
     time::Duration,
 };
 
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 pub const MAX_ENABLED_CHANNELS: usize = 128;
 pub const BUILTIN_CATALOG: &str = include_str!("../../data/channels.txt");
@@ -59,6 +61,7 @@ pub struct ChangeSummary {
     pub changed: usize,
     pub removed: usize,
     pub not_found: Vec<String>,
+    pub changed_names: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -73,6 +76,10 @@ pub enum ChannelError {
     Version(u32),
     #[error("invalid public Telegram channel: {0}")]
     InvalidName(String),
+    #[error("Telegram channel `{name}` is not a searchable public message source: {reason}")]
+    InvalidSource { name: String, reason: String },
+    #[error("could not verify Telegram channel `{name}`: {reason}")]
+    ValidationUncertain { name: String, reason: String },
     #[error("channel not found: {0}; add it with `pansou channel add` first")]
     NotFound(String),
     #[error(
@@ -83,6 +90,144 @@ pub enum ChannelError {
     ImportLine { line: usize, reason: String },
     #[error("channel import failed: {0}")]
     Import(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPageKind {
+    PublicMessages,
+    Bot,
+    NoPublicMessages,
+    Unknown,
+}
+
+/// Classify a successful `t.me/s/<name>` response without relying on live
+/// Telegram in tests. Profile pages are known, but not searchable archives.
+pub fn classify_channel_page(html: &str, expected_name: &str) -> ChannelPageKind {
+    let document = Html::parse_document(html);
+    let message = Selector::parse(".tgme_widget_message[data-post]")
+        .expect("static Telegram message selector");
+    let expected_prefix = format!("{expected_name}/");
+    if document.select(&message).any(|node| {
+        node.value()
+            .attr("data-post")
+            .is_some_and(|post| post.to_ascii_lowercase().starts_with(&expected_prefix))
+    }) {
+        return ChannelPageKind::PublicMessages;
+    }
+
+    let normalized = html.to_ascii_lowercase();
+    // Telegram renders this sentinel inside an otherwise valid public channel
+    // archive when the requested query has no matching posts.
+    if normalized.contains("tme_no_messages_found") || normalized.contains("no posts found") {
+        return ChannelPageKind::PublicMessages;
+    }
+    if normalized.contains("start bot")
+        || normalized.contains("monthly users")
+        || normalized.contains("monthly user")
+        || normalized.contains("?start=")
+    {
+        return ChannelPageKind::Bot;
+    }
+    if normalized.contains("tgme_page_wrap")
+        || normalized.contains("tgme_page_error")
+        || normalized.contains("tgme_channel_info")
+    {
+        return ChannelPageKind::NoPublicMessages;
+    }
+    ChannelPageKind::Unknown
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelValidator {
+    client: reqwest::Client,
+    base_url: Url,
+    timeout: Duration,
+}
+
+impl ChannelValidator {
+    pub fn new(client: reqwest::Client, timeout: Duration) -> Self {
+        Self::with_base_url(
+            client,
+            Url::parse("https://t.me/").expect("static Telegram URL"),
+            timeout,
+        )
+    }
+
+    pub fn with_base_url(client: reqwest::Client, base_url: Url, timeout: Duration) -> Self {
+        Self {
+            client,
+            base_url,
+            timeout,
+        }
+    }
+
+    pub async fn validate(&self, names: &[String]) -> Result<Vec<String>, ChannelError> {
+        let names = normalize_channels(names)?;
+        for name in &names {
+            self.validate_one(name).await?;
+        }
+        Ok(names)
+    }
+
+    async fn validate_one(&self, name: &str) -> Result<(), ChannelError> {
+        let url = self.base_url.join(&format!("s/{name}")).map_err(|error| {
+            ChannelError::ValidationUncertain {
+                name: name.to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let response = self
+            .client
+            .get(url)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|error| ChannelError::ValidationUncertain {
+                name: name.to_owned(),
+                reason: error.without_url().to_string(),
+            })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            return Err(ChannelError::ValidationUncertain {
+                name: name.to_owned(),
+                reason: format!("Telegram returned HTTP {status}"),
+            });
+        }
+        if status.is_client_error() {
+            return Err(ChannelError::InvalidSource {
+                name: name.to_owned(),
+                reason: format!("Telegram returned HTTP {status}"),
+            });
+        }
+        if !status.is_success() {
+            return Err(ChannelError::ValidationUncertain {
+                name: name.to_owned(),
+                reason: format!("unexpected HTTP {status}"),
+            });
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| ChannelError::ValidationUncertain {
+                name: name.to_owned(),
+                reason: error.without_url().to_string(),
+            })?;
+        match classify_channel_page(&body, name) {
+            ChannelPageKind::PublicMessages => Ok(()),
+            ChannelPageKind::Bot => Err(ChannelError::InvalidSource {
+                name: name.to_owned(),
+                reason: "it is a bot, not a public channel".into(),
+            }),
+            ChannelPageKind::NoPublicMessages => Err(ChannelError::InvalidSource {
+                name: name.to_owned(),
+                reason: "it has no public /s/<name> message archive".into(),
+            }),
+            ChannelPageKind::Unknown => Err(ChannelError::ValidationUncertain {
+                name: name.to_owned(),
+                reason: "Telegram returned an unrecognized page".into(),
+            }),
+        }
+    }
 }
 
 /// Normalize a public channel address. Short aliases are accepted for parity
@@ -227,6 +372,9 @@ impl ChannelStore {
         lock.lock()?;
         let mut list = self.load()?;
         let summary = operation(&mut list)?;
+        if summary.added == 0 && summary.changed == 0 && summary.removed == 0 {
+            return Ok(summary);
+        }
         let enabled = list.channels.iter().filter(|c| c.enabled).count();
         if enforce_limit && enabled > MAX_ENABLED_CHANNELS {
             return Err(ChannelError::Limit(enabled));
@@ -289,6 +437,28 @@ impl ChannelStore {
                 if channel.enabled != enabled {
                     channel.enabled = enabled;
                     summary.changed += 1;
+                }
+            }
+            Ok(summary)
+        })
+    }
+
+    /// Disable the named channels only when they are currently enabled and
+    /// already present in this store. This makes it safe to pass a mixture of
+    /// saved and one-off CLI/environment search sources.
+    pub fn disable_existing(&self, names: &[String]) -> Result<ChangeSummary, ChannelError> {
+        let names = normalize_channels(names)?;
+        self.modify(false, |list| {
+            let mut summary = ChangeSummary::default();
+            for name in names {
+                if let Some(channel) = list
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.name == name && channel.enabled)
+                {
+                    channel.enabled = false;
+                    summary.changed += 1;
+                    summary.changed_names.push(name);
                 }
             }
             Ok(summary)
@@ -393,6 +563,169 @@ mod tests {
         ] {
             assert!(normalize_channel(input).is_err(), "{input}");
         }
+    }
+
+    #[test]
+    fn classifies_searchable_archives_and_known_non_sources() {
+        let archive = r#"<div class="tgme_widget_message" data-post="Demo/42"></div>"#;
+        assert_eq!(
+            classify_channel_page(archive, "demo"),
+            ChannelPageKind::PublicMessages
+        );
+        assert_eq!(
+            classify_channel_page(
+                r#"<div class="tgme_page_wrap"><div>12 345 monthly users</div><a>Start Bot</a></div>"#,
+                "demobot"
+            ),
+            ChannelPageKind::Bot
+        );
+        assert_eq!(
+            classify_channel_page(r#"<div class="tgme_page_wrap">Send Message</div>"#, "demo"),
+            ChannelPageKind::NoPublicMessages
+        );
+        assert_eq!(
+            classify_channel_page("upstream maintenance", "demo"),
+            ChannelPageKind::Unknown
+        );
+        assert_eq!(
+            classify_channel_page(
+                r#"<div class="tgme_channel_info"></div><div class="tme_no_messages_found">No posts found</div>"#,
+                "demo"
+            ),
+            ChannelPageKind::PublicMessages
+        );
+    }
+
+    #[test]
+    fn disable_existing_ignores_temporary_and_already_disabled_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChannelStore::new(dir.path().join("channels.toml"));
+        store.add(&names(&["saved", "off"]), true).unwrap();
+        store.set_enabled(&names(&["off"]), false).unwrap();
+
+        let change = store
+            .disable_existing(&names(&["saved", "off", "temporary"]))
+            .unwrap();
+        assert_eq!(change.changed, 1);
+        assert_eq!(change.changed_names, ["saved"]);
+        let list = store.load().unwrap();
+        assert!(
+            !list
+                .channels
+                .iter()
+                .find(|c| c.name == "saved")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !list
+                .channels
+                .iter()
+                .find(|c| c.name == "off")
+                .unwrap()
+                .enabled
+        );
+        assert!(!list.channels.iter().any(|c| c.name == "temporary"));
+
+        let untouched = ChannelStore::new(dir.path().join("absent.toml"));
+        assert_eq!(
+            untouched
+                .disable_existing(&names(&["temporary"]))
+                .unwrap()
+                .changed,
+            0
+        );
+        assert!(!untouched.path().exists());
+    }
+
+    #[tokio::test]
+    async fn validator_distinguishes_invalid_and_uncertain_pages() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/s/good"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<div class="tgme_widget_message" data-post="good/1"></div>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/s/demobot"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<div class="tgme_page_wrap">20 monthly users <a>Start Bot</a></div>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/s/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/s/busy"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/s/changed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("new Telegram markup"))
+            .mount(&server)
+            .await;
+        let validator = ChannelValidator::with_base_url(
+            reqwest::Client::new(),
+            Url::parse(&format!("{}/", server.uri())).unwrap(),
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            validator.validate(&names(&["@GOOD"])).await.unwrap(),
+            ["good"]
+        );
+        assert!(matches!(
+            validator.validate(&names(&["demobot"])).await,
+            Err(ChannelError::InvalidSource { .. })
+        ));
+        assert!(matches!(
+            validator.validate(&names(&["missing"])).await,
+            Err(ChannelError::InvalidSource { .. })
+        ));
+        for name in ["busy", "changed"] {
+            assert!(matches!(
+                validator.validate(&names(&[name])).await,
+                Err(ChannelError::ValidationUncertain { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn validating_a_batch_finishes_before_callers_save_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/s/good"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<div class="tgme_widget_message" data-post="good/1"></div>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/s/bad"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let validator = ChannelValidator::with_base_url(
+            reqwest::Client::new(),
+            Url::parse(&format!("{}/", server.uri())).unwrap(),
+            Duration::from_secs(2),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChannelStore::new(dir.path().join("channels.toml"));
+
+        let validated = validator.validate(&names(&["good", "bad"])).await;
+        assert!(validated.is_err());
+        assert!(!store.path().exists());
     }
 
     #[test]

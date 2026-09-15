@@ -93,6 +93,7 @@ provider。每个被选择的频道或 provider 都视为一个独立 source。
 选择 sources
   -> 共享并发请求（每 source timeout + 搜索阶段总时限）
   -> 每个 source 完成后发送批次或 SourceError
+  -> 汇总确定失效的 TG source，一次性禁用已保存频道
   -> query/include/exclude/cloud 过滤
   -> 批次内部排序，增量合并链接
   -> result / result_update 事件
@@ -105,6 +106,9 @@ Telegram 和 `Core` 模式的 provider 由搜索引擎执行本地 query 过滤�
 TG 正文命中完整查询时保留消息链接，否则按链接 work_title（缺失时消息标题）过滤。
 Telegram 每频道只请求一个公开搜索页面，解析正文及 inline keyboard 的资源链接和密码，
 按规范化 URL 去重；没有正文但存在有效按钮链接的消息也可保留。
+搜索响应只有在明确表示 bot、404/410 或无公开消息归档时才生成
+`invalid_source`；空搜索结果和暂时性错误不使用该类型。CLI 在搜索结束时仅禁用
+`channels.toml` 中已存在且已启用的对应频道，临时来源不落盘。
 
 ### 3.4 Providers (`src/providers`)
 

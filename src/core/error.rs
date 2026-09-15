@@ -20,6 +20,8 @@ pub enum ProviderError {
     Protocol(String),
     #[error("provider is unavailable: {0}")]
     Unavailable(String),
+    #[error("invalid search source: {0}")]
+    InvalidSource(String),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
