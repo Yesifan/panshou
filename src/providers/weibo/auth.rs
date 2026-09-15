@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, path::Path};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Response, header};
 use url::Url;
 
@@ -18,34 +17,7 @@ pub struct QrChallenge {
     pub image_png: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QrTerminalProtocol {
-    Iterm2,
-    Kitty,
-}
-
 impl QrChallenge {
-    /// Render the QR bitmap with a terminal's native inline-image protocol.
-    pub fn terminal_escape(&self, protocol: QrTerminalProtocol) -> String {
-        let image = STANDARD.encode(&self.image_png);
-        match protocol {
-            QrTerminalProtocol::Iterm2 => {
-                format!("\x1b]1337;File=inline=1;preserveAspectRatio=1:{image}\x07")
-            }
-            QrTerminalProtocol::Kitty => format!("\x1b_Gf=100,a=T;{image}\x1b\\"),
-        }
-    }
-
-    pub fn terminal_escape_from_env(&self) -> Option<String> {
-        if std::env::var_os("KITTY_WINDOW_ID").is_some() {
-            return Some(self.terminal_escape(QrTerminalProtocol::Kitty));
-        }
-        if std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "iTerm.app") {
-            return Some(self.terminal_escape(QrTerminalProtocol::Iterm2));
-        }
-        None
-    }
-
     /// Persist the original QR bitmap for terminals which cannot render images.
     pub fn write_png(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         std::fs::write(path, &self.image_png)
@@ -116,16 +88,14 @@ impl WeiboAuth {
             .and_then(|v| v.as_str())
             .or_else(|| value.get("qrid").and_then(|v| v.as_str()))
             .ok_or_else(|| ProviderError::Protocol("Weibo QR response omitted qrid".into()))?;
-        let api_key = value
+        let image_url = value
             .pointer("/data/image")
             .and_then(|v| v.as_str())
-            .and_then(api_key_from_image)
-            .or_else(|| find_api_key(&body).map(str::to_owned))
-            .ok_or_else(|| ProviderError::Protocol("Weibo QR response omitted api_key".into()))?;
+            .ok_or_else(|| ProviderError::Protocol("Weibo QR response omitted image URL".into()))?;
+        let image_url = qr_image_url(&self.endpoints.qr_image, image_url)?;
         let image_png = self
             .client
-            .get(self.endpoints.qr_image.clone())
-            .query(&[("api_key", api_key.as_str())])
+            .get(image_url)
             .header(header::USER_AGENT, USER_AGENT)
             .header(header::REFERER, self.endpoints.web_origin.as_str())
             .send()
@@ -137,9 +107,9 @@ impl WeiboAuth {
             .await
             .map_err(network)?
             .to_vec();
-        if image_png.is_empty() {
+        if !image_png.starts_with(b"\x89PNG\r\n\x1a\n") {
             return Err(ProviderError::Protocol(
-                "Weibo returned an empty QR image".into(),
+                "Weibo QR image endpoint did not return PNG data".into(),
             ));
         }
         Ok(QrChallenge {
@@ -332,19 +302,15 @@ fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
         .join("; ")
 }
 
-fn api_key_from_image(image: &str) -> Option<String> {
-    Url::parse(image)
-        .ok()?
-        .query_pairs()
-        .find(|(key, _)| key == "api_key")
-        .map(|(_, value)| value.into_owned())
-}
-
-fn find_api_key(body: &str) -> Option<&str> {
-    let start = body.find("api_key=")? + "api_key=".len();
-    let rest = &body[start..];
-    let end = rest.find(['"', '&', '\\']).unwrap_or(rest.len());
-    (!rest[..end].is_empty()).then_some(&rest[..end])
+fn qr_image_url(endpoint: &Url, returned: &str) -> Result<Url, ProviderError> {
+    let returned = Url::parse(returned)
+        .map_err(|error| ProviderError::Parse(format!("invalid Weibo QR image URL: {error}")))?;
+    let query = returned.query().ok_or_else(|| {
+        ProviderError::Protocol("Weibo QR image URL omitted its signed query".into())
+    })?;
+    let mut image_url = endpoint.clone();
+    image_url.set_query(Some(query));
+    Ok(image_url)
 }
 
 pub(crate) fn jsonp_value(body: &str) -> Result<serde_json::Value, ProviderError> {
@@ -385,13 +351,21 @@ mod tests {
             value.pointer("/data/qrid").and_then(|v| v.as_str()),
             Some("qr-fixture")
         );
-        assert_eq!(
-            find_api_key(include_str!(
-                "../../../tests/fixtures/providers/weibo/qr.jsonp"
-            )),
-            Some("fixture-key")
-        );
         assert!(jsonp_value("callback(not-json)").is_err());
+    }
+
+    #[test]
+    fn qr_image_keeps_the_complete_signed_query_on_the_configured_endpoint() {
+        let endpoint = Url::parse("http://127.0.0.1:1234/qr-image").unwrap();
+        let image = qr_image_url(
+            &endpoint,
+            "https://v2.qr.weibo.cn/inf/gen?api_key=key&data=payload&sign=signature&size=180",
+        )
+        .unwrap();
+        assert_eq!(
+            image.as_str(),
+            "http://127.0.0.1:1234/qr-image?api_key=key&data=payload&sign=signature&size=180"
+        );
     }
 
     #[test]

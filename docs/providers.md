@@ -50,7 +50,8 @@ pansou provider configure qqpd --profile main \
   --channel pd97631607 --channel languan8K115
 ```
 
-登录二维码优先绘制在终端；终端不支持时会生成临时 PNG。频道会被规范化和去重，并缓存
+登录二维码会在交互式终端中使用 Unicode 半块字符绘制，QQPD 和 Weibo 均可通过 SSH
+直接扫码；非交互输出或二维码解析失败时才会生成临时 PNG。频道会被规范化和去重，并缓存
 `guild_id`。QQPD 在搜索前按需执行 session keepalive。
 
 ## Weibo

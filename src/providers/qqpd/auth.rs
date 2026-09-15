@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, path::Path};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Response, header};
 use url::Url;
 
@@ -17,31 +16,7 @@ pub struct QqQrChallenge {
     pub image_png: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QqQrTerminalProtocol {
-    Iterm2,
-    Kitty,
-}
-
 impl QqQrChallenge {
-    pub fn terminal_escape(&self, protocol: QqQrTerminalProtocol) -> String {
-        let image = STANDARD.encode(&self.image_png);
-        match protocol {
-            QqQrTerminalProtocol::Iterm2 => {
-                format!("\x1b]1337;File=inline=1;preserveAspectRatio=1:{image}\x07")
-            }
-            QqQrTerminalProtocol::Kitty => format!("\x1b_Gf=100,a=T;{image}\x1b\\"),
-        }
-    }
-    pub fn terminal_escape_from_env(&self) -> Option<String> {
-        if std::env::var_os("KITTY_WINDOW_ID").is_some() {
-            return Some(self.terminal_escape(QqQrTerminalProtocol::Kitty));
-        }
-        if std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "iTerm.app") {
-            return Some(self.terminal_escape(QqQrTerminalProtocol::Iterm2));
-        }
-        None
-    }
     pub fn write_png(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         std::fs::write(path, &self.image_png)
     }

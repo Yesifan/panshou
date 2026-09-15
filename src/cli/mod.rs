@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::OsString,
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::Path,
     process::Command as ProcessCommand,
     str::FromStr,
@@ -845,12 +845,7 @@ async fn run_provider(
                     let provider = QqpdProvider::new(store.clone());
                     let auth = provider.auth_session(session);
                     let challenge = auth.begin().await?;
-                    let _qr_file = if let Some(image) = challenge.terminal_escape_from_env() {
-                        println!("{image}");
-                        None
-                    } else {
-                        Some(show_qr_png("qqpd", &challenge.image_png)?)
-                    };
+                    let _qr_file = show_qr("qqpd", &challenge.image_png)?;
                     loop {
                         tokio::select! {
                             signal = tokio::signal::ctrl_c() => {
@@ -889,12 +884,7 @@ async fn run_provider(
                     let provider = WeiboProvider::new(store.clone());
                     let auth = provider.auth_session(session);
                     let challenge = auth.begin().await?;
-                    let _qr_file = if let Some(image) = challenge.terminal_escape_from_env() {
-                        println!("{image}");
-                        None
-                    } else {
-                        Some(show_qr_png("weibo", &challenge.image_png)?)
-                    };
+                    let _qr_file = show_qr("weibo", &challenge.image_png)?;
                     loop {
                         tokio::select! {
                             signal = tokio::signal::ctrl_c() => {
@@ -1117,6 +1107,37 @@ fn show_qr_png(provider: &str, image: &[u8]) -> anyhow::Result<tempfile::TempPat
     Ok(path)
 }
 
+fn show_qr(provider: &str, image_png: &[u8]) -> anyhow::Result<Option<tempfile::TempPath>> {
+    if io::stdout().is_terminal() {
+        match render_qr_terminal(image_png) {
+            Ok(qr) => {
+                println!("Scan this QR code to log in:\n{qr}");
+                return Ok(None);
+            }
+            Err(error) => eprintln!("Could not render QR code in the terminal: {error}"),
+        }
+    }
+    Ok(Some(show_qr_png(provider, image_png)?))
+}
+
+fn render_qr_terminal(image_png: &[u8]) -> anyhow::Result<String> {
+    use qrcode::{QrCode, render::unicode::Dense1x2};
+
+    let image = image::load_from_memory_with_format(image_png, image::ImageFormat::Png)?.to_luma8();
+    let mut prepared = rqrr::PreparedImage::prepare(image);
+    let grid = prepared
+        .detect_grids()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("PNG does not contain a QR code"))?;
+    let (_, payload) = grid
+        .decode()
+        .map_err(|error| anyhow::anyhow!("could not decode QR code: {error}"))?;
+    let code = QrCode::new(payload.as_bytes())?;
+    let qr = code.render::<Dense1x2>().module_dimensions(1, 1).build();
+    Ok(format!("\x1b[30;47m{qr}\x1b[0m"))
+}
+
 fn write_qr_png(provider: &str, image: &[u8]) -> anyhow::Result<tempfile::TempPath> {
     let mut file = tempfile::Builder::new()
         .prefix(&format!("pansou-{provider}-"))
@@ -1168,6 +1189,27 @@ mod tests {
             first.extension().and_then(|value| value.to_str()),
             Some("png")
         );
+    }
+
+    #[test]
+    fn qr_png_renders_as_dense_terminal_modules() {
+        use image::DynamicImage;
+        use qrcode::QrCode;
+
+        let source = QrCode::new(b"https://example.com/login").unwrap();
+        let image = source
+            .render::<image::Luma<u8>>()
+            .min_dimensions(180, 180)
+            .build();
+        let mut png = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageLuma8(image)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+
+        let rendered = render_qr_terminal(png.get_ref()).unwrap();
+        assert!(rendered.starts_with("\x1b[30;47m"));
+        assert!(rendered.contains(['█', '▀', '▄']));
+        assert!(rendered.ends_with("\x1b[0m"));
     }
 
     #[test]
