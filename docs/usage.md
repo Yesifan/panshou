@@ -36,7 +36,7 @@ pansou search "仙逆" --source provider \
 pansou search "仙逆" --include 4K --exclude 预告 \
   --jobs 4 --timeout 20 --all-timeout 600
 
-# 默认检测链接并只输出 ok；可显式关闭检测并显示全部结果
+# 默认检测支持的网盘链接并只输出 ok；Magnet/ED2K 原样保留
 pansou search "仙逆" --format json
 pansou search "仙逆" --no-check --format json
 ```
@@ -63,8 +63,9 @@ TG 每频道只请求一次公开搜索页，不翻页、不自动重试；解�
 `--format json` 输出单个格式化 JSON 文档，包含最终链接、来源错误、搜索摘要及检测摘要，
 适合脚本读取。搜索和独立 `check` 命令均只支持 `table` 与 `json`。
 
-搜索默认只在链接检测状态为 `ok` 时保留。`bad`、
-`locked`、`uncertain` 和 `unsupported` 均会被过滤。`--no-check` 跳过检测并输出
+搜索默认只在受支持的网盘链接检测状态为 `ok` 时保留。`bad`、`locked`、
+`uncertain` 和 `unsupported` 均会被过滤。Magnet 和 ED2K 不适用网盘链接检测，
+因此不会进入检测队列，并会原样保留且不附加 `check` 状态。`--no-check` 跳过检测并输出
 全部搜索结果，末尾摘要标记为 `unchecked`。
 搜索总时限结束后，已接收链接的检测仍可继续，因此命令总耗时可能超过 `--all-timeout`。
 

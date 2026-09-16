@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     channel::ChannelStore,
     check::{CheckEngine, CheckItem, CheckOptions, CheckResult},
-    core::{MergedLink, canonical_url_key},
+    core::{CloudType, MergedLink, canonical_url_key},
     output::{OutputFormat, SearchCheckSummary, stdout, write_search},
     search::{
         FinishReason, SearchEngine, SearchEvent, SearchOptions, SearchOutcome, SearchSummary,
@@ -190,7 +190,7 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
                 match event {
                     SearchEvent::Result { id, link } | SearchEvent::ResultUpdate { id, link } => {
                         if interrupted { continue; }
-                        if checker.is_some() {
+                        if checker.is_some() && requires_link_check(link.cloud_type) {
                             let key = check_key(&link);
                             if !checked.contains_key(&key) && scheduled.insert(key.clone()) {
                                 let mut item = CheckItem::detect(link.url);
@@ -254,7 +254,7 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
     for links in outcome.links_by_type.values_mut() {
         links.retain_mut(|link| {
             let Some(result) = checked.get(&check_key(link)) else {
-                return !require_ok;
+                return !require_ok || !requires_link_check(link.cloud_type);
             };
             final_checked += 1;
             *link = attach_check(link.clone(), result);
@@ -285,6 +285,10 @@ async fn drive<W: Write, F: Future<Output = std::io::Result<()>>>(
     };
     write_search(&mut writer, &outcome, &summary, &checks, format)?;
     Ok(code)
+}
+
+fn requires_link_check(cloud_type: CloudType) -> bool {
+    !matches!(cloud_type, CloudType::Magnet | CloudType::Ed2k)
 }
 
 fn check_key(link: &MergedLink) -> String {
@@ -379,6 +383,29 @@ mod tests {
             let mut link = Link::new("https://pan.quark.cn/s/abc123");
             link.password = self.password.map(str::to_owned);
             result.links.push(link);
+            Ok(vec![result])
+        }
+    }
+
+    struct MixedLinksProvider;
+    #[async_trait]
+    impl Provider for MixedLinksProvider {
+        fn meta(&self) -> ProviderMeta {
+            ProviderMeta::stateless("mixed-fixture", 3, KeywordFilterMode::Provider)
+        }
+
+        async fn search(
+            &self,
+            _: &SearchContext,
+            _: &str,
+        ) -> Result<Vec<SearchResult>, ProviderError> {
+            let mut result = SearchResult::provider("mixed-fixture", "mixed-fixture");
+            result.title = "query".into();
+            result.links.extend([
+                Link::new("https://pan.quark.cn/s/abc123"),
+                Link::new("magnet:?xt=urn:btih:abcdef1234567890"),
+                Link::new("ed2k://|file|example.mkv|123|ABCDEF|/"),
+            ]);
             Ok(vec![result])
         }
     }
@@ -483,6 +510,51 @@ mod tests {
         let document: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(document["total_links"], 0);
         assert_eq!(document["checks"]["candidates"], 1);
+        assert_eq!(document["checks"]["checked"], 1);
+        assert_eq!(document["checks"]["valid"], 0);
+    }
+
+    #[tokio::test]
+    async fn unchecked_link_types_survive_valid_only_filter() {
+        let (engine, options) = setup(vec![Arc::new(MixedLinksProvider)]);
+        let checker = Arc::new(CheckEngine::with_checkers(
+            reqwest::Client::new(),
+            None,
+            vec![Arc::new(BadChecker)],
+        ));
+        let mut output = Vec::new();
+        let code = drive(
+            engine,
+            options,
+            Some(checker),
+            CheckOptions::default(),
+            OutputFormat::Json,
+            true,
+            false,
+            true,
+            None,
+            &mut output,
+            futures::future::pending(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, EXIT_OK);
+        let document: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(document["total_links"], 2);
+        assert!(document["links_by_type"].get("quark").is_none());
+        assert_eq!(
+            document["links_by_type"]["magnet"][0]["cloud_type"],
+            "magnet"
+        );
+        assert!(
+            document["links_by_type"]["magnet"][0]
+                .get("check")
+                .is_none()
+        );
+        assert_eq!(document["links_by_type"]["ed2k"][0]["cloud_type"], "ed2k");
+        assert!(document["links_by_type"]["ed2k"][0].get("check").is_none());
+        assert_eq!(document["checks"]["candidates"], 3);
         assert_eq!(document["checks"]["checked"], 1);
         assert_eq!(document["checks"]["valid"], 0);
     }
