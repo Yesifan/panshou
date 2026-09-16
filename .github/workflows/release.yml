@@ -41,7 +41,7 @@ jobs:
             artifact: pansou-windows-x86_64
             builder: cargo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -78,7 +78,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/pansou.exe" "dist/pansou.exe"
           Compress-Archive -Path "dist/pansou.exe" -DestinationPath "${{ matrix.artifact }}.zip"
       - name: Upload release archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -91,7 +91,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
@@ -103,7 +103,7 @@ jobs:
           done
           sha256sum pansou-*.tar.gz pansou-*.zip > SHA256SUMS
           sha256sum --check SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: pansou-checksums
           path: dist/SHA256SUMS
@@ -114,7 +114,7 @@ jobs:
     needs: checksums
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
