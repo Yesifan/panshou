@@ -60,3 +60,15 @@ keep each commit focused. Pull requests should explain intent and user-visible
 effects, list validation commands, link related issues when applicable, and add
 sample CLI output when output contracts change. All formatting, Clippy, tests,
 and platform builds must pass before merge.
+
+### Release
+
+版本格式为 `MAJOR.MINOR.PATCH`：
+- `MAJOR`：包含不兼容变更
+- `MINOR`：新增向后兼容的功能
+- `PATCH`：向后兼容的问题修复
+
+预发布版本使用：
+- `v1.2.0-alpha.1`
+- `v1.2.0-beta.1`
+- `v1.2.0-rc.1`
