@@ -42,6 +42,7 @@ pub const EXIT_DEADLINE: i32 = 124;
 pub const EXIT_INTERRUPTED: i32 = 130;
 
 const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources. Use short, focused keywords; longer queries may reduce search quality.\nInteractive terminals show progress on stderr; final results are written to stdout. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
+const QQPD_LOGIN_GUIDANCE: &str = "Scan the QR code with the QQ mobile app and confirm on your phone. After login, configure at least one QQ channel with:\n  pansou provider configure qqpd --profile <PROFILE> --channel <CHANNEL_ID_OR_PD_URL>\nOpen the channel in your browser and copy its https://pd.qq.com/g/<CHANNEL_ID> URL; either the channel ID or the full URL is accepted.";
 const WEIBO_LOGIN_GUIDANCE: &str = "Scan the QR code with the Weibo mobile app and confirm on your phone. After login, add at least one target user with:\n  pansou provider configure weibo add --profile <PROFILE> --user <UID_OR_PROFILE_URL>\nPansou returns keyword-matched posts only when a supported cloud-drive, magnet, or ed2k link is found in the post, a linked page, or the first comment fallback.";
 const WEIBO_USER_GUIDANCE: &str = "Open the target user's Weibo profile and copy its URL. For example, https://weibo.com/u/1234567890 contains UID 1234567890. Either the numeric UID or the full profile URL can be passed to --user.";
 
@@ -253,13 +254,21 @@ pub struct LoginArgs {
 #[derive(Debug, Subcommand)]
 pub enum LoginProviderCommand {
     /// QR code login; scan with QQ.
-    Qqpd(ProfileArgs),
+    Qqpd(QqpdLoginArgs),
     /// QR code login with the Weibo mobile app.
     Weibo(WeiboLoginArgs),
     /// Username/password login.
     Gying(PasswordLoginArgs),
     /// Username/password login.
     Panlian(PasswordLoginArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(after_long_help = QQPD_LOGIN_GUIDANCE)]
+pub struct QqpdLoginArgs {
+    /// Profile name for the saved session.
+    #[arg(long, default_value = "main")]
+    pub profile: String,
 }
 
 #[derive(Debug, Args)]
@@ -903,6 +912,9 @@ async fn run_provider(
                     let provider = QqpdProvider::new(store.clone());
                     let auth = provider.auth_session(session);
                     let challenge = auth.begin().await?;
+                    eprintln!(
+                        "Use the QQ mobile app to scan the QR code, then confirm login on your phone."
+                    );
                     let _qr_file = show_qr("qqpd", &challenge.image_png)?;
                     loop {
                         tokio::select! {
@@ -926,9 +938,26 @@ async fn run_provider(
                                 } else {
                                     println!("qqpd/{}: logged in as {qq_masked}", args.profile);
                                 }
+                                if provider
+                                    .load_profile(&args.profile)?
+                                    .is_some_and(|profile| profile.channels.is_empty())
+                                {
+                                    println!(
+                                        "\nNext, configure a QQ channel:\n  pansou provider configure qqpd --profile {} --channel <CHANNEL_ID_OR_PD_URL>",
+                                        args.profile
+                                    );
+                                    println!(
+                                        "Open the channel in your browser and copy its https://pd.qq.com/g/<CHANNEL_ID> URL; the channel ID or full URL is accepted."
+                                    );
+                                }
                                 break;
                             }
-                            QqQrStatus::Expired => return Err(usage("QQPD QR code expired")),
+                            QqQrStatus::Expired => {
+                                return Err(usage(format!(
+                                    "QQPD QR code expired; run `pansou provider login qqpd --profile {}` again to get a new code",
+                                    args.profile
+                                )));
+                            }
                             QqQrStatus::Scanned => {
                                 eprintln!("QR scanned; confirm login on the device")
                             }

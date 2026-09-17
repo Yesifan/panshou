@@ -152,6 +152,17 @@ fn weibo_login_help_explains_scan_and_target_user_setup() {
 }
 
 #[test]
+fn qqpd_login_help_explains_scan_and_channel_setup() {
+    let error = Cli::try_parse_from(["pansou", "provider", "login", "qqpd", "--help"]).unwrap_err();
+    let help = error.to_string();
+    assert!(help.contains("QQ mobile app"));
+    assert!(help.contains("confirm on your phone"));
+    assert!(help.contains("provider configure qqpd"));
+    assert!(help.contains("CHANNEL_ID_OR_PD_URL"));
+    assert!(help.contains("https://pd.qq.com/g/<CHANNEL_ID>"));
+}
+
+#[test]
 fn parses_weibo_target_user_actions() {
     for action in ["add", "del", "list"] {
         let mut args = vec![
