@@ -1081,10 +1081,11 @@ async fn run_provider(
                         .await;
                     match login {
                         Ok(_) => {}
-                        Err(crate::core::ProviderError::AuthRequired) => {
-                            return Err(usage(
-                                "Gying login failed; check the username, password, and configured base URL",
-                            ));
+                        Err(error @ crate::core::ProviderError::AuthRequired) => {
+                            eprintln!(
+                                "Gying login failed; check the username, password, and configured base URL"
+                            );
+                            return Err(error.into());
                         }
                         Err(error) => return Err(error.into()),
                     }
@@ -1123,10 +1124,9 @@ async fn run_provider(
                         .await;
                     match login {
                         Ok(_) => {}
-                        Err(crate::core::ProviderError::AuthRequired) => {
-                            return Err(usage(
-                                "Panlian login failed; check the username and password",
-                            ));
+                        Err(error @ crate::core::ProviderError::AuthRequired) => {
+                            eprintln!("Panlian login failed; check the username and password");
+                            return Err(error.into());
                         }
                         Err(error) => return Err(error.into()),
                     }
