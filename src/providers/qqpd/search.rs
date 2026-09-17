@@ -160,7 +160,7 @@ impl QqpdProvider {
         self.store.delete("qqpd", name).map_err(state_error)
     }
 
-    pub async fn configure_channels<I, S>(
+    pub async fn add_channels<I, S>(
         &self,
         client: &Client,
         profile: &str,
@@ -170,10 +170,17 @@ impl QqpdProvider {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let channels = normalize_channels(values)?;
+        let additions = normalize_channels(values)?;
         let mut state = self
             .load_profile(profile)?
             .unwrap_or_else(|| QqpdProfile::authenticated("", ""));
+        let mut seen = state.channels.iter().cloned().collect::<HashSet<_>>();
+        state.channels.extend(
+            additions
+                .into_iter()
+                .filter(|channel| seen.insert(channel.clone())),
+        );
+        let channels = state.channels.clone();
         let existing = state.channel_guild_ids.clone();
         let base = self.endpoints.guild_page.clone();
         let resolutions = stream::iter(channels.iter().cloned().map(|channel| {
@@ -202,6 +209,38 @@ impl QqpdProvider {
             .save("qqpd", profile, &state)
             .map_err(state_error)?;
         Ok(channels)
+    }
+
+    pub fn delete_channels<I, S>(
+        &self,
+        profile: &str,
+        values: I,
+    ) -> Result<Vec<String>, ProviderError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let removals = normalize_channels(values)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut state = self
+            .load_profile(profile)?
+            .unwrap_or_else(|| QqpdProfile::authenticated("", ""));
+        state.channels.retain(|channel| !removals.contains(channel));
+        state
+            .channel_guild_ids
+            .retain(|channel, _| state.channels.contains(channel));
+        self.store
+            .save("qqpd", profile, &state)
+            .map_err(state_error)?;
+        Ok(state.channels)
+    }
+
+    pub fn target_channels(&self, profile: &str) -> Result<Vec<String>, ProviderError> {
+        Ok(self
+            .load_profile(profile)?
+            .map(|state| state.channels)
+            .unwrap_or_default())
     }
 
     fn active_profiles(&self) -> Result<Vec<(String, QqpdProfile)>, ProviderError> {
@@ -686,7 +725,7 @@ mod tests {
         let provider = QqpdProvider::new(StateStore::with_cipher(tmp.path(), None));
         provider.save_login("main", "p_skey=x", "masked").unwrap();
         let channels = provider
-            .configure_channels(&Client::new(), "main", ["12345", "12345"])
+            .add_channels(&Client::new(), "main", ["12345", "12345"])
             .await
             .unwrap();
         assert_eq!(channels, ["12345"]);
@@ -694,6 +733,26 @@ mod tests {
         assert_eq!(
             state.channel_guild_ids.get("12345").map(String::as_str),
             Some("12345")
+        );
+        assert_eq!(
+            provider
+                .add_channels(&Client::new(), "main", ["12345", "67890"])
+                .await
+                .unwrap(),
+            ["12345", "67890"]
+        );
+        assert_eq!(
+            provider
+                .delete_channels("main", ["12345", "missing"])
+                .unwrap(),
+            ["67890"]
+        );
+        assert_eq!(provider.target_channels("main").unwrap(), ["67890"]);
+        let state = provider.load_profile("main").unwrap().unwrap();
+        assert!(!state.channel_guild_ids.contains_key("12345"));
+        assert_eq!(
+            state.channel_guild_ids.get("67890").map(String::as_str),
+            Some("67890")
         );
     }
 
@@ -708,12 +767,12 @@ mod tests {
             QqpdProvider::with_endpoints(StateStore::with_cipher(tmp.path(), None), endpoints);
         provider.save_login("main", "p_skey=x", "masked").unwrap();
         provider
-            .configure_channels(&Client::new(), "main", ["12345"])
+            .add_channels(&Client::new(), "main", ["12345"])
             .await
             .unwrap();
         assert!(
             provider
-                .configure_channels(&Client::new(), "main", ["named-channel"])
+                .add_channels(&Client::new(), "main", ["named-channel"])
                 .await
                 .is_err()
         );

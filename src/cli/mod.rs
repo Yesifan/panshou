@@ -42,7 +42,8 @@ pub const EXIT_DEADLINE: i32 = 124;
 pub const EXIT_INTERRUPTED: i32 = 130;
 
 const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources. Use short, focused keywords; longer queries may reduce search quality.\nInteractive terminals show progress on stderr; final results are written to stdout. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
-const QQPD_LOGIN_GUIDANCE: &str = "Scan the QR code with the QQ mobile app and confirm on your phone. After login, configure at least one QQ channel with:\n  pansou provider configure qqpd --profile <PROFILE> --channel <CHANNEL_ID_OR_PD_URL>\nOpen the channel in your browser and copy its https://pd.qq.com/g/<CHANNEL_ID> URL; either the channel ID or the full URL is accepted.";
+const QQPD_LOGIN_GUIDANCE: &str = "Scan the QR code with the QQ mobile app and confirm on your phone. After login, configure at least one QQ channel with:\n  pansou provider configure qqpd add --profile <PROFILE> --channel <CHANNEL_ID_OR_PD_URL>\nOpen the channel in your browser and copy its https://pd.qq.com/g/<CHANNEL_ID> URL; either the channel ID or the full URL is accepted.";
+const QQPD_CHANNEL_GUIDANCE: &str = "Open the QQ channel in your browser and copy its URL. For example, https://pd.qq.com/g/example contains channel ID example. Either the channel ID or the full URL can be passed to --channel.";
 const WEIBO_LOGIN_GUIDANCE: &str = "Scan the QR code with the Weibo mobile app and confirm on your phone. After login, add at least one target user with:\n  pansou provider configure weibo add --profile <PROFILE> --user <UID_OR_PROFILE_URL>\nPansou returns keyword-matched posts only when a supported cloud-drive, magnet, or ed2k link is found in the post, a linked page, or the first comment fallback.";
 const WEIBO_USER_GUIDANCE: &str = "Open the target user's Weibo profile and copy its URL. For example, https://weibo.com/u/1234567890 contains UID 1234567890. Either the numeric UID or the full profile URL can be passed to --user.";
 
@@ -338,7 +339,7 @@ pub struct ConfigureArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigureProviderCommand {
-    /// Configure QQPD search channels.
+    /// Add, remove, or list QQPD search channels.
     Qqpd(QqpdConfigureArgs),
     /// Add, remove, or list Weibo target users.
     Weibo(WeiboConfigureArgs),
@@ -350,13 +351,30 @@ pub enum ConfigureProviderCommand {
 
 #[derive(Debug, Args)]
 pub struct QqpdConfigureArgs {
+    #[command(subcommand)]
+    pub action: QqpdConfigureCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum QqpdConfigureCommand {
+    /// Add channels without removing existing ones.
+    Add(QqpdChannelMutationArgs),
+    /// Remove channels; missing channels are ignored.
+    Del(QqpdChannelMutationArgs),
+    /// List configured channel IDs.
+    List(ProfileArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(after_long_help = QQPD_CHANNEL_GUIDANCE)]
+pub struct QqpdChannelMutationArgs {
     /// Profile to configure.
     #[arg(long, default_value = "main")]
     pub profile: String,
-    /// Comma-separated channel identifiers.
+    /// Comma-separated channel IDs or pd.qq.com channel URLs.
     #[arg(long, value_delimiter = ',')]
     pub channels: Vec<String>,
-    /// Channel identifier; repeat as needed.
+    /// Channel ID or pd.qq.com channel URL; repeat as needed.
     #[arg(long = "channel")]
     pub channel: Vec<String>,
 }
@@ -943,7 +961,7 @@ async fn run_provider(
                                     .is_some_and(|profile| profile.channels.is_empty())
                                 {
                                     println!(
-                                        "\nNext, configure a QQ channel:\n  pansou provider configure qqpd --profile {} --channel <CHANNEL_ID_OR_PD_URL>",
+                                        "\nNext, configure a QQ channel:\n  pansou provider configure qqpd add --profile {} --channel <CHANNEL_ID_OR_PD_URL>",
                                         args.profile
                                     );
                                     println!(
@@ -1075,21 +1093,71 @@ async fn run_provider(
         }
         ProviderCommand::Configure(args) => match args.provider {
             ConfigureProviderCommand::Qqpd(args) => {
-                let _ = store.profile_path("qqpd", &args.profile)?;
                 let (http, _, _, _) = client(config, None, None)?;
                 let provider = QqpdProvider::new(store.clone());
+                let profile = match &args.action {
+                    QqpdConfigureCommand::Add(args) | QqpdConfigureCommand::Del(args) => {
+                        &args.profile
+                    }
+                    QqpdConfigureCommand::List(args) => &args.profile,
+                };
+                let _ = store.profile_path("qqpd", profile)?;
                 if !provider
-                    .load_profile(&args.profile)?
+                    .load_profile(profile)?
                     .is_some_and(|profile| profile.is_ready(chrono::Utc::now()))
                 {
                     eprintln!("provider qqpd requires login");
                     return Ok(EXIT_AUTH_REQUIRED);
                 }
-                let channels = args.channels.into_iter().chain(args.channel);
-                let saved = provider
-                    .configure_channels(&http, &args.profile, channels)
-                    .await?;
-                println!("qqpd/{}: {} channels", args.profile, saved.len());
+                match args.action {
+                    QqpdConfigureCommand::Add(args) => {
+                        let channels = args
+                            .channels
+                            .into_iter()
+                            .chain(args.channel)
+                            .collect::<Vec<_>>();
+                        if channels.is_empty() {
+                            return Err(usage(
+                                "qqpd add requires at least one --channel or --channels",
+                            ));
+                        }
+                        let before = provider.target_channels(&args.profile)?.len();
+                        let saved = provider
+                            .add_channels(&http, &args.profile, channels)
+                            .await?;
+                        println!(
+                            "qqpd/{}: added {}; {} channels",
+                            args.profile,
+                            saved.len().saturating_sub(before),
+                            saved.len()
+                        );
+                    }
+                    QqpdConfigureCommand::Del(args) => {
+                        let channels = args
+                            .channels
+                            .into_iter()
+                            .chain(args.channel)
+                            .collect::<Vec<_>>();
+                        if channels.is_empty() {
+                            return Err(usage(
+                                "qqpd del requires at least one --channel or --channels",
+                            ));
+                        }
+                        let before = provider.target_channels(&args.profile)?.len();
+                        let saved = provider.delete_channels(&args.profile, channels)?;
+                        println!(
+                            "qqpd/{}: removed {}; {} channels remain",
+                            args.profile,
+                            before.saturating_sub(saved.len()),
+                            saved.len()
+                        );
+                    }
+                    QqpdConfigureCommand::List(args) => {
+                        for channel in provider.target_channels(&args.profile)? {
+                            println!("{channel}");
+                        }
+                    }
+                }
             }
             ConfigureProviderCommand::Weibo(args) => {
                 let provider = WeiboProvider::new(store.clone());

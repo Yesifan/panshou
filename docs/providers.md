@@ -42,19 +42,24 @@ pansou provider logout qqpd --profile main
 ```bash
 pansou provider login qqpd --profile main
 
-pansou provider configure qqpd --profile main \
+pansou provider configure qqpd add --profile main \
   --channels pd97631607,languan8K115
 
 # 也可以重复指定
-pansou provider configure qqpd --profile main \
+pansou provider configure qqpd add --profile main \
   --channel pd97631607 --channel languan8K115
+
+pansou provider configure qqpd list --profile main
+pansou provider configure qqpd del --profile main --channel pd97631607
 ```
 
 登录二维码会在交互式终端中使用 Unicode 半块字符绘制。请使用手机 QQ 扫码并在手机端确认；
 可通过 SSH 直接扫码，非交互输出或二维码解析失败时才会生成临时 PNG。二维码过期后命令会
 退出，并提示重新运行登录命令。
 
-登录成功后必须至少配置一个频道，该 profile 才会参与搜索。打开 QQ 频道网页版并复制
+登录成功后必须至少配置一个频道，该 profile 才会参与搜索。`add` 会合并并去重，`del` 移除
+指定频道，`list` 显示当前频道；删除最后一个频道不会注销 profile，但它不会参与搜索。打开
+QQ 频道网页版并复制
 `https://pd.qq.com/g/<频道ID>` 地址；`--channel` 既接受频道 ID，也接受完整 URL。频道会被
 规范化和去重，并缓存 `guild_id`。QQPD 在搜索前按需执行 session keepalive。
 

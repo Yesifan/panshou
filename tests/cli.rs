@@ -1,7 +1,7 @@
 use clap::Parser;
 use pansou::cli::{
-    Cli, Command, ConfigureProviderCommand, LoginProviderCommand, ProviderCommand, SourceSelection,
-    WeiboConfigureCommand,
+    Cli, Command, ConfigureProviderCommand, LoginProviderCommand, ProviderCommand,
+    QqpdConfigureCommand, SourceSelection, WeiboConfigureCommand,
 };
 use pansou::output::OutputFormat;
 use std::process::Command as ProcessCommand;
@@ -157,9 +157,44 @@ fn qqpd_login_help_explains_scan_and_channel_setup() {
     let help = error.to_string();
     assert!(help.contains("QQ mobile app"));
     assert!(help.contains("confirm on your phone"));
-    assert!(help.contains("provider configure qqpd"));
+    assert!(help.contains("provider configure qqpd add"));
     assert!(help.contains("CHANNEL_ID_OR_PD_URL"));
     assert!(help.contains("https://pd.qq.com/g/<CHANNEL_ID>"));
+}
+
+#[test]
+fn parses_qqpd_channel_actions() {
+    for action in ["add", "del", "list"] {
+        let mut args = vec![
+            "pansou",
+            "provider",
+            "configure",
+            "qqpd",
+            action,
+            "--profile",
+            "main",
+        ];
+        if action != "list" {
+            args.extend(["--channel", "https://pd.qq.com/g/example"]);
+        }
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Provider(provider) = cli.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommand::Configure(configure) = provider.command else {
+            panic!("expected configure command");
+        };
+        let ConfigureProviderCommand::Qqpd(qqpd) = configure.provider else {
+            panic!("expected QQPD configuration");
+        };
+        let profile = match qqpd.action {
+            QqpdConfigureCommand::Add(args) if action == "add" => args.profile,
+            QqpdConfigureCommand::Del(args) if action == "del" => args.profile,
+            QqpdConfigureCommand::List(args) if action == "list" => args.profile,
+            _ => panic!("unexpected QQPD action"),
+        };
+        assert_eq!(profile, "main");
+    }
 }
 
 #[test]

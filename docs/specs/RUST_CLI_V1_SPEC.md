@@ -496,7 +496,7 @@ pansou provider login qqpd --profile main
 频道配置：
 
 ```bash
-pansou provider configure qqpd \
+pansou provider configure qqpd add \
   --profile main \
   --channels pd97631607,languan8K115
 ```
@@ -504,7 +504,7 @@ pansou provider configure qqpd \
 也支持：
 
 ```bash
-pansou provider configure qqpd \
+pansou provider configure qqpd add \
   --profile main \
   --channel pd97631607 \
   --channel languan8K115
@@ -2923,7 +2923,7 @@ pansou check \
 ```bash
 pansou provider login qqpd --profile main
 
-pansou provider configure qqpd \
+pansou provider configure qqpd add \
   --profile main \
   --channels xxx,yyy
 ```
