@@ -139,11 +139,7 @@ impl WeiboProvider {
             .map_err(state_error)
     }
 
-    pub fn configure_users<I, S>(
-        &self,
-        profile: &str,
-        values: I,
-    ) -> Result<Vec<String>, ProviderError>
+    pub fn add_users<I, S>(&self, profile: &str, values: I) -> Result<Vec<String>, ProviderError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -151,11 +147,40 @@ impl WeiboProvider {
         let mut state = self
             .load_profile(profile)?
             .unwrap_or_else(|| WeiboProfile::authenticated(""));
-        state.user_ids = normalize_user_ids(values)?;
+        let additions = normalize_user_ids(values)?;
+        let mut seen = state.user_ids.iter().cloned().collect::<HashSet<_>>();
+        state
+            .user_ids
+            .extend(additions.into_iter().filter(|id| seen.insert(id.clone())));
         self.store
             .save("weibo", profile, &state)
             .map_err(state_error)?;
         Ok(state.user_ids)
+    }
+
+    pub fn delete_users<I, S>(&self, profile: &str, values: I) -> Result<Vec<String>, ProviderError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut state = self
+            .load_profile(profile)?
+            .unwrap_or_else(|| WeiboProfile::authenticated(""));
+        let removals = normalize_user_ids(values)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        state.user_ids.retain(|id| !removals.contains(id));
+        self.store
+            .save("weibo", profile, &state)
+            .map_err(state_error)?;
+        Ok(state.user_ids)
+    }
+
+    pub fn target_users(&self, profile: &str) -> Result<Vec<String>, ProviderError> {
+        Ok(self
+            .load_profile(profile)?
+            .map(|state| state.user_ids)
+            .unwrap_or_default())
     }
 
     pub fn logout(&self, profile: &str) -> Result<bool, ProviderError> {
@@ -721,12 +746,23 @@ mod tests {
         provider.save_login("main", "SUB=x; SUBP=y").unwrap();
         assert_eq!(
             provider
-                .configure_users("main", ["123", "https://weibo.com/u/456", "123"])
+                .add_users("main", ["123", "https://weibo.com/u/456", "123"])
                 .unwrap(),
             ["123", "456"]
         );
+        assert_eq!(
+            provider
+                .add_users("main", ["456", "https://weibo.com/u/789"])
+                .unwrap(),
+            ["123", "456", "789"]
+        );
+        assert_eq!(
+            provider.delete_users("main", ["456", "999"]).unwrap(),
+            ["123", "789"]
+        );
+        assert_eq!(provider.target_users("main").unwrap(), ["123", "789"]);
         let state = provider.load_profile("main").unwrap().unwrap();
         assert!(state.is_ready(Utc::now()));
-        assert_eq!(state.user_ids, ["123", "456"]);
+        assert_eq!(state.user_ids, ["123", "789"]);
     }
 }

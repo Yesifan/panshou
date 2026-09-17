@@ -1,5 +1,8 @@
 use clap::Parser;
-use pansou::cli::{Cli, Command, ProviderCommand, SourceSelection};
+use pansou::cli::{
+    Cli, Command, ConfigureProviderCommand, LoginProviderCommand, ProviderCommand, SourceSelection,
+    WeiboConfigureCommand,
+};
 use pansou::output::OutputFormat;
 use std::process::Command as ProcessCommand;
 
@@ -114,7 +117,9 @@ fn provider_password_is_never_a_command_line_argument() {
     ])
     .unwrap();
     assert!(matches!(cli.command, Command::Provider(args)
-        if matches!(args.command, ProviderCommand::Login(ref login) if login.password_stdin)));
+        if matches!(args.command, ProviderCommand::Login(ref login)
+            if matches!(login.provider, LoginProviderCommand::Gying(ref login)
+                if login.password_stdin))));
 }
 
 #[test]
@@ -126,8 +131,69 @@ fn provider_login_help_lists_names_and_login_methods() {
     }
     assert!(help.contains("QR code login"));
     assert!(help.contains("Username/password login"));
-    assert!(help.contains("requires --username"));
+
+    let error =
+        Cli::try_parse_from(["pansou", "provider", "login", "gying", "--help"]).unwrap_err();
+    let help = error.to_string();
+    assert!(help.contains("--username"));
     assert!(help.contains("--password-stdin"));
+}
+
+#[test]
+fn weibo_login_help_explains_scan_and_target_user_setup() {
+    let error =
+        Cli::try_parse_from(["pansou", "provider", "login", "weibo", "--help"]).unwrap_err();
+    let help = error.to_string();
+    assert!(help.contains("Weibo mobile app"));
+    assert!(help.contains("confirm on your phone"));
+    assert!(help.contains("provider configure weibo add"));
+    assert!(help.contains("UID_OR_PROFILE_URL"));
+    assert!(help.contains("cloud-drive, magnet, or ed2k link"));
+}
+
+#[test]
+fn parses_weibo_target_user_actions() {
+    for action in ["add", "del", "list"] {
+        let mut args = vec![
+            "pansou",
+            "provider",
+            "configure",
+            "weibo",
+            action,
+            "--profile",
+            "main",
+        ];
+        if action != "list" {
+            args.extend(["--user", "https://weibo.com/u/1234567890"]);
+        }
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Provider(provider) = cli.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommand::Configure(configure) = provider.command else {
+            panic!("expected configure command");
+        };
+        let ConfigureProviderCommand::Weibo(weibo) = configure.provider else {
+            panic!("expected Weibo configuration");
+        };
+        let profile = match weibo.action {
+            WeiboConfigureCommand::Add(args) if action == "add" => args.profile,
+            WeiboConfigureCommand::Del(args) if action == "del" => args.profile,
+            WeiboConfigureCommand::List(args) if action == "list" => args.profile,
+            _ => panic!("unexpected Weibo action"),
+        };
+        assert_eq!(profile, "main");
+    }
+}
+
+#[test]
+fn weibo_configure_help_explains_how_to_find_a_uid() {
+    let error = Cli::try_parse_from(["pansou", "provider", "configure", "weibo", "add", "--help"])
+        .unwrap_err();
+    let help = error.to_string();
+    assert!(help.contains("Add target users without removing existing ones"));
+    assert!(help.contains("https://weibo.com/u/1234567890"));
+    assert!(help.contains("Either the numeric UID or the full profile URL"));
 }
 
 #[test]

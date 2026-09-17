@@ -576,16 +576,23 @@ QR
 目标用户：
 
 ```bash
-pansou provider configure weibo \
+pansou provider configure weibo add \
   --profile main \
   --users 1234567890,2345678901
 ```
 
-或者重复：
+`add` 合并并去重，也可以重复指定：
 
 ```bash
 --user 1234567890
 --user 2345678901
+```
+
+移除或查看目标用户：
+
+```bash
+pansou provider configure weibo del --profile main --user 1234567890
+pansou provider configure weibo list --profile main
 ```
 
 同时支持输入：

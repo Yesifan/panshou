@@ -42,6 +42,8 @@ pub const EXIT_DEADLINE: i32 = 124;
 pub const EXIT_INTERRUPTED: i32 = 130;
 
 const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources. Use short, focused keywords; longer queries may reduce search quality.\nInteractive terminals show progress on stderr; final results are written to stdout. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
+const WEIBO_LOGIN_GUIDANCE: &str = "Scan the QR code with the Weibo mobile app and confirm on your phone. After login, add at least one target user with:\n  pansou provider configure weibo add --profile <PROFILE> --user <UID_OR_PROFILE_URL>\nPansou returns keyword-matched posts only when a supported cloud-drive, magnet, or ed2k link is found in the post, a linked page, or the first comment fallback.";
+const WEIBO_USER_GUIDANCE: &str = "Open the target user's Weibo profile and copy its URL. For example, https://weibo.com/u/1234567890 contains UID 1234567890. Either the numeric UID or the full profile URL can be passed to --user.";
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -244,8 +246,39 @@ pub enum ProviderCommand {
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Provider name. See the possible values below for its login method.
-    pub name: LoginProviderName,
+    #[command(subcommand)]
+    pub provider: LoginProviderCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LoginProviderCommand {
+    /// QR code login; scan with QQ.
+    Qqpd(ProfileArgs),
+    /// QR code login with the Weibo mobile app.
+    Weibo(WeiboLoginArgs),
+    /// Username/password login.
+    Gying(PasswordLoginArgs),
+    /// Username/password login.
+    Panlian(PasswordLoginArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileArgs {
+    /// Profile name for the saved session.
+    #[arg(long, default_value = "main")]
+    pub profile: String,
+}
+
+#[derive(Debug, Args)]
+#[command(after_long_help = WEIBO_LOGIN_GUIDANCE)]
+pub struct WeiboLoginArgs {
+    /// Profile name for the saved session.
+    #[arg(long, default_value = "main")]
+    pub profile: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PasswordLoginArgs {
     /// Profile name for the saved session.
     #[arg(long, default_value = "main")]
     pub profile: String,
@@ -262,13 +295,9 @@ pub struct LoginArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum LoginProviderName {
-    /// QR code login; scan with QQ. No username or password options are needed.
     Qqpd,
-    /// QR code login; scan with Weibo. No username or password options are needed.
     Weibo,
-    /// Username/password login; requires --username. The password is prompted unless --password-stdin is used; --remember-credentials is optional.
     Gying,
-    /// Username/password login; requires --username. The password is prompted unless --password-stdin is used; --remember-credentials is optional.
     Panlian,
 }
 
@@ -284,10 +313,6 @@ impl LoginProviderName {
         }
     }
 
-    const fn supports_remembered_credentials(self) -> bool {
-        matches!(self, Self::Gying | Self::Panlian)
-    }
-
     const fn auth_label(self) -> &'static str {
         match self {
             Self::Qqpd | Self::Weibo => "qr",
@@ -298,26 +323,74 @@ impl LoginProviderName {
 
 #[derive(Debug, Args)]
 pub struct ConfigureArgs {
-    /// Provider name.
-    pub name: String,
+    #[command(subcommand)]
+    pub provider: ConfigureProviderCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigureProviderCommand {
+    /// Configure QQPD search channels.
+    Qqpd(QqpdConfigureArgs),
+    /// Add, remove, or list Weibo target users.
+    Weibo(WeiboConfigureArgs),
+    /// Configure the Gying service endpoint.
+    Gying(GyingConfigureArgs),
+    /// Configure Panlian cloud-drive filtering.
+    Panlian(PanlianConfigureArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct QqpdConfigureArgs {
     /// Profile to configure.
     #[arg(long, default_value = "main")]
     pub profile: String,
-    /// Comma-separated provider-specific channel identifiers.
+    /// Comma-separated channel identifiers.
     #[arg(long, value_delimiter = ',')]
     pub channels: Vec<String>,
-    /// Provider-specific channel identifier; repeat as needed.
+    /// Channel identifier; repeat as needed.
     #[arg(long = "channel")]
     pub channel: Vec<String>,
-    /// Comma-separated provider-specific user identifiers.
+}
+
+#[derive(Debug, Args)]
+pub struct WeiboConfigureArgs {
+    #[command(subcommand)]
+    pub action: WeiboConfigureCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WeiboConfigureCommand {
+    /// Add target users without removing existing ones.
+    Add(WeiboUserMutationArgs),
+    /// Remove target users; missing users are ignored.
+    Del(WeiboUserMutationArgs),
+    /// List configured target user IDs.
+    List(ProfileArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(after_long_help = WEIBO_USER_GUIDANCE)]
+pub struct WeiboUserMutationArgs {
+    /// Profile to configure.
+    #[arg(long, default_value = "main")]
+    pub profile: String,
+    /// Comma-separated numeric UIDs or Weibo profile URLs.
     #[arg(long, value_delimiter = ',')]
     pub users: Vec<String>,
-    /// Provider-specific user identifier; repeat as needed.
+    /// Numeric UID or Weibo profile URL; repeat as needed.
     #[arg(long = "user")]
     pub user: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct GyingConfigureArgs {
     /// Provider base URL.
     #[arg(long)]
-    pub base_url: Option<String>,
+    pub base_url: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PanlianConfigureArgs {
     /// Cloud-drive type to block for this provider; repeat as needed.
     #[arg(long = "blocked-cloud")]
     pub blocked_clouds: Vec<String>,
@@ -821,17 +894,10 @@ async fn run_provider(
             }
         }
         ProviderCommand::Login(args) => {
-            let name = args.name.as_str();
-            let _ = store.profile_path(name, &args.profile)?;
-            if args.remember_credentials
-                && args.name.supports_remembered_credentials()
-                && !store.encryption_enabled()
-            {
-                return Err(usage("--remember-credentials requires PANSOU_STATE_KEY"));
-            }
-            let (_, _, _, mut options) = client(config, None, None)?;
-            match args.name {
-                LoginProviderName::Qqpd => {
+            let (_, _, _, options) = client(config, None, None)?;
+            match args.provider {
+                LoginProviderCommand::Qqpd(args) => {
+                    let _ = store.profile_path("qqpd", &args.profile)?;
                     let factory = HttpClientFactory::new();
                     let session = factory.session(&options)?;
                     let provider = QqpdProvider::new(store.clone());
@@ -870,12 +936,17 @@ async fn run_provider(
                         }
                     }
                 }
-                LoginProviderName::Weibo => {
+                LoginProviderCommand::Weibo(args) => {
+                    let _ = store.profile_path("weibo", &args.profile)?;
+                    let mut options = options;
                     options.redirect = RedirectPolicy::None;
                     let session = HttpClientFactory::new().session(&options)?;
                     let provider = WeiboProvider::new(store.clone());
                     let auth = provider.auth_session(session);
                     let challenge = auth.begin().await?;
+                    eprintln!(
+                        "Use the Weibo mobile app to scan the QR code, then confirm login on your phone."
+                    );
                     let _qr_file = show_qr("weibo", &challenge.image_png)?;
                     loop {
                         tokio::select! {
@@ -894,9 +965,24 @@ async fn run_provider(
                                 })?;
                                 provider.save_login(&args.profile, cookie)?;
                                 println!("weibo/{}: logged in", args.profile);
+                                println!(
+                                    "\nNext, add a target Weibo user:\n  pansou provider configure weibo add --profile {} --user <UID_OR_PROFILE_URL>",
+                                    args.profile
+                                );
+                                println!(
+                                    "Open the target user's Weibo profile to copy its URL. For example, https://weibo.com/u/1234567890 contains UID 1234567890; the UID or full profile URL is accepted."
+                                );
+                                println!(
+                                    "Pansou returns keyword-matched posts only when a supported cloud-drive, magnet, or ed2k link is found in the post, a linked page, or the first comment fallback."
+                                );
                                 break;
                             }
-                            QrStatus::Expired => return Err(usage("Weibo QR code expired")),
+                            QrStatus::Expired => {
+                                return Err(usage(format!(
+                                    "Weibo QR code expired; run `pansou provider login weibo --profile {}` again to get a new code",
+                                    args.profile
+                                )));
+                            }
                             QrStatus::Scanned => {
                                 eprintln!("QR scanned; confirm login on the device")
                             }
@@ -904,7 +990,11 @@ async fn run_provider(
                         }
                     }
                 }
-                LoginProviderName::Gying => {
+                LoginProviderCommand::Gying(args) => {
+                    let _ = store.profile_path("gying", &args.profile)?;
+                    if args.remember_credentials && !store.encryption_enabled() {
+                        return Err(usage("--remember-credentials requires PANSOU_STATE_KEY"));
+                    }
                     let username = required_username(args.username.as_deref())?;
                     let password = read_password(args.password_stdin)?;
                     let provider = GyingProvider::load(
@@ -923,7 +1013,11 @@ async fn run_provider(
                         .await?;
                     println!("gying/{}: logged in", args.profile);
                 }
-                LoginProviderName::Panlian => {
+                LoginProviderCommand::Panlian(args) => {
+                    let _ = store.profile_path("panlian", &args.profile)?;
+                    if args.remember_credentials && !store.encryption_enabled() {
+                        return Err(usage("--remember-credentials requires PANSOU_STATE_KEY"));
+                    }
                     let username = required_username(args.username.as_deref())?;
                     let password = read_password(args.password_stdin)?;
                     let factory = HttpClientFactory::new();
@@ -950,57 +1044,89 @@ async fn run_provider(
                 }
             }
         }
-        ProviderCommand::Configure(args) => {
-            require_stateful_name(&args.name)?;
-            let _ = store.profile_path(&args.name, &args.profile)?;
-            match args.name.as_str() {
-                "qqpd" => {
-                    let (http, _, _, _) = client(config, None, None)?;
-                    let provider = QqpdProvider::new(store.clone());
-                    if !provider
-                        .load_profile(&args.profile)?
-                        .is_some_and(|profile| profile.is_ready(chrono::Utc::now()))
-                    {
-                        eprintln!("provider qqpd requires login");
-                        return Ok(EXIT_AUTH_REQUIRED);
-                    }
-                    let channels = args.channels.into_iter().chain(args.channel);
-                    let saved = provider
-                        .configure_channels(&http, &args.profile, channels)
-                        .await?;
-                    println!("qqpd/{}: {} channels", args.profile, saved.len());
+        ProviderCommand::Configure(args) => match args.provider {
+            ConfigureProviderCommand::Qqpd(args) => {
+                let _ = store.profile_path("qqpd", &args.profile)?;
+                let (http, _, _, _) = client(config, None, None)?;
+                let provider = QqpdProvider::new(store.clone());
+                if !provider
+                    .load_profile(&args.profile)?
+                    .is_some_and(|profile| profile.is_ready(chrono::Utc::now()))
+                {
+                    eprintln!("provider qqpd requires login");
+                    return Ok(EXIT_AUTH_REQUIRED);
                 }
-                "weibo" => {
-                    let provider = WeiboProvider::new(store.clone());
-                    if !provider
-                        .load_profile(&args.profile)?
-                        .is_some_and(|profile| profile.is_ready(chrono::Utc::now()))
-                    {
-                        eprintln!("provider weibo requires login");
-                        return Ok(EXIT_AUTH_REQUIRED);
-                    }
-                    let users = args.users.into_iter().chain(args.user);
-                    let saved = provider.configure_users(&args.profile, users)?;
-                    println!("weibo/{}: {} target users", args.profile, saved.len());
-                }
-                "gying" => {
-                    let base = args
-                        .base_url
-                        .ok_or_else(|| usage("--base-url is required for gying"))?;
-                    GyingEndpoints::parse(&base)?;
-                    config.providers.gying.base_url = base;
-                    save_config(paths, config)?;
-                }
-                "panlian" => {
-                    for cloud in &args.blocked_clouds {
-                        CloudType::from_str(cloud)?;
-                    }
-                    config.providers.panlian.blocked_clouds = args.blocked_clouds;
-                    save_config(paths, config)?;
-                }
-                _ => return Err(usage(format!("unknown provider: {}", args.name))),
+                let channels = args.channels.into_iter().chain(args.channel);
+                let saved = provider
+                    .configure_channels(&http, &args.profile, channels)
+                    .await?;
+                println!("qqpd/{}: {} channels", args.profile, saved.len());
             }
-        }
+            ConfigureProviderCommand::Weibo(args) => {
+                let provider = WeiboProvider::new(store.clone());
+                let profile = match &args.action {
+                    WeiboConfigureCommand::Add(args) | WeiboConfigureCommand::Del(args) => {
+                        &args.profile
+                    }
+                    WeiboConfigureCommand::List(args) => &args.profile,
+                };
+                let _ = store.profile_path("weibo", profile)?;
+                if !provider
+                    .load_profile(profile)?
+                    .is_some_and(|profile| profile.is_ready(chrono::Utc::now()))
+                {
+                    eprintln!("provider weibo requires login");
+                    return Ok(EXIT_AUTH_REQUIRED);
+                }
+                match args.action {
+                    WeiboConfigureCommand::Add(args) => {
+                        let users = args.users.into_iter().chain(args.user).collect::<Vec<_>>();
+                        if users.is_empty() {
+                            return Err(usage("weibo add requires at least one --user or --users"));
+                        }
+                        let before = provider.target_users(&args.profile)?.len();
+                        let saved = provider.add_users(&args.profile, users)?;
+                        println!(
+                            "weibo/{}: added {}; {} target users",
+                            args.profile,
+                            saved.len().saturating_sub(before),
+                            saved.len()
+                        );
+                    }
+                    WeiboConfigureCommand::Del(args) => {
+                        let users = args.users.into_iter().chain(args.user).collect::<Vec<_>>();
+                        if users.is_empty() {
+                            return Err(usage("weibo del requires at least one --user or --users"));
+                        }
+                        let before = provider.target_users(&args.profile)?.len();
+                        let saved = provider.delete_users(&args.profile, users)?;
+                        println!(
+                            "weibo/{}: removed {}; {} target users remain",
+                            args.profile,
+                            before.saturating_sub(saved.len()),
+                            saved.len()
+                        );
+                    }
+                    WeiboConfigureCommand::List(args) => {
+                        for user in provider.target_users(&args.profile)? {
+                            println!("{user}");
+                        }
+                    }
+                }
+            }
+            ConfigureProviderCommand::Gying(args) => {
+                GyingEndpoints::parse(&args.base_url)?;
+                config.providers.gying.base_url = args.base_url;
+                save_config(paths, config)?;
+            }
+            ConfigureProviderCommand::Panlian(args) => {
+                for cloud in &args.blocked_clouds {
+                    CloudType::from_str(cloud)?;
+                }
+                config.providers.panlian.blocked_clouds = args.blocked_clouds;
+                save_config(paths, config)?;
+            }
+        },
     }
     Ok(EXIT_OK)
 }

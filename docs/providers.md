@@ -56,15 +56,39 @@ pansou provider configure qqpd --profile main \
 
 ## Weibo
 
+`profile` 是一套独立的微博登录会话（Cookie）的本地名称，并不是目标微博用户。可以使用
+多个 profile 登录不同的微博账号；搜索时会使用所有已登录且已配置目标用户的 profile。每个
+目标用户只会搜索一次；若多个 profile 配置了同一目标用户，会由其中一个 profile 执行搜索。
+
 ```bash
+# 在终端显示二维码后，使用手机微博 App 扫码，并在手机端确认登录
 pansou provider login weibo --profile main
 
-pansou provider configure weibo --profile main \
-  --users 1234567890,2345678901
+# 添加一个或多个需要搜索的目标微博用户
+pansou provider configure weibo add --profile main \
+  --user 1234567890 --user https://weibo.com/u/2345678901
+
+# 查看或移除当前 profile 的目标用户
+pansou provider configure weibo list --profile main
+pansou provider configure weibo del --profile main --user 1234567890
 ```
 
-`--user` 可以重复使用，也可以传入 `https://weibo.com/u/1234567890`；保存时会规范化为
-数字用户 ID。
+二维码会在交互式终端中显示；可通过 SSH 直接扫码。请使用手机微博 App 扫描，并在手机端
+确认登录。二维码过期后，登录命令会退出并提示二维码已过期；重新运行
+`pansou provider login weibo --profile main` 获取新的二维码。可用 `Ctrl-C` 取消等待。
+
+登录成功后必须至少添加一个目标用户，该 profile 才会参与搜索。`add` 会合并并去重，适合
+重复执行；`del` 只移除指定用户；`list` 显示当前已配置的目标用户。删除最后一个目标用户
+不会注销该 profile，但它不会参与搜索。
+
+`--user` 接受数字微博 UID，也接受包含数字 UID 的微博主页 URL。打开目标用户的微博主页，
+从地址栏复制 URL 即可：`https://weibo.com/u/1234567890` 中的 UID 是 `1234567890`，可以
+直接将该 URL 传给 `--user`，也可以只传该数字。昵称和无法从 URL 确定数字 UID 的自定义短链接
+不能用于配置目标用户。
+
+Pansou 会在目标用户的关键词搜索结果中，从微博正文、附带网页以及（前两者没有下载链接时）
+第一条评论兜底中查找受支持的网盘、磁力或 ed2k 链接；没有下载链接的普通微博不会返回。它不会
+遍历全部评论，也不会把任意普通网页链接作为结果输出。
 
 ## Gying 和 Panlian
 
