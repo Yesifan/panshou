@@ -44,6 +44,7 @@ pub const EXIT_INTERRUPTED: i32 = 130;
 const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources. Use short, focused keywords; longer queries may reduce search quality.\nInteractive terminals show progress on stderr; final results are written to stdout. --timeout excludes queueing; --all-timeout includes queueing, but excludes initialization and link checking.";
 const QQPD_LOGIN_GUIDANCE: &str = "Scan the QR code with the QQ mobile app and confirm on your phone. After login, configure at least one QQ channel with:\n  pansou provider configure qqpd add --profile <PROFILE> --channel <CHANNEL_ID_OR_PD_URL>\nOpen the channel in your browser and copy its https://pd.qq.com/g/<CHANNEL_ID> URL; either the channel ID or the full URL is accepted.";
 const QQPD_CHANNEL_GUIDANCE: &str = "Open the QQ channel in your browser and copy its URL. For example, https://pd.qq.com/g/example contains channel ID example. Either the channel ID or the full URL can be passed to --channel.";
+const GYING_LOGIN_GUIDANCE: &str = "Gying is ready to search immediately after login. It uses the configured provider base URL; change it only when the service moves or you use a mirror:\n  pansou provider configure gying --base-url <URL>\nPasswords are prompted securely by default. --remember-credentials requires PANSOU_STATE_KEY and allows one automatic login retry when the saved cookie expires.";
 const WEIBO_LOGIN_GUIDANCE: &str = "Scan the QR code with the Weibo mobile app and confirm on your phone. After login, add at least one target user with:\n  pansou provider configure weibo add --profile <PROFILE> --user <UID_OR_PROFILE_URL>\nPansou returns keyword-matched posts only when a supported cloud-drive, magnet, or ed2k link is found in the post, a linked page, or the first comment fallback.";
 const WEIBO_USER_GUIDANCE: &str = "Open the target user's Weibo profile and copy its URL. For example, https://weibo.com/u/1234567890 contains UID 1234567890. Either the numeric UID or the full profile URL can be passed to --user.";
 
@@ -259,7 +260,7 @@ pub enum LoginProviderCommand {
     /// QR code login with the Weibo mobile app.
     Weibo(WeiboLoginArgs),
     /// Username/password login.
-    Gying(PasswordLoginArgs),
+    Gying(GyingLoginArgs),
     /// Username/password login.
     Panlian(PasswordLoginArgs),
 }
@@ -299,6 +300,23 @@ pub struct PasswordLoginArgs {
     #[arg(long)]
     pub password_stdin: bool,
     /// Remember credentials for providers that support automatic login.
+    #[arg(long)]
+    pub remember_credentials: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(after_long_help = GYING_LOGIN_GUIDANCE)]
+pub struct GyingLoginArgs {
+    /// Profile name for the saved session.
+    #[arg(long, default_value = "main")]
+    pub profile: String,
+    /// Account username.
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Read the account password from standard input instead of prompting.
+    #[arg(long)]
+    pub password_stdin: bool,
+    /// Save encrypted credentials for one automatic login retry after cookie expiry.
     #[arg(long)]
     pub remember_credentials: bool,
 }
@@ -1044,21 +1062,35 @@ async fn run_provider(
                     }
                     let username = required_username(args.username.as_deref())?;
                     let password = read_password(args.password_stdin)?;
+                    eprintln!("Logging in to Gying; server verification may take a moment.");
                     let provider = GyingProvider::load(
                         store.clone(),
                         GyingEndpoints::parse(&config.providers.gying.base_url)?,
                         HttpClientFactory::new(),
                         options,
                     )?;
-                    provider
+                    let login = provider
                         .login(
                             &args.profile,
                             username,
                             &password,
                             args.remember_credentials,
                         )
-                        .await?;
-                    println!("gying/{}: logged in", args.profile);
+                        .await;
+                    match login {
+                        Ok(_) => {}
+                        Err(crate::core::ProviderError::AuthRequired) => {
+                            return Err(usage(
+                                "Gying login failed; check the username, password, and configured base URL",
+                            ));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                    println!("gying/{}: logged in and ready", args.profile);
+                    println!(
+                        "Verify with: pansou provider status gying --profile {}",
+                        args.profile
+                    );
                 }
                 LoginProviderCommand::Panlian(args) => {
                     let _ = store.profile_path("panlian", &args.profile)?;

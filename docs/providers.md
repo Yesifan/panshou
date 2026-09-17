@@ -99,16 +99,16 @@ Pansou 会在目标用户的关键词搜索结果中，从微博正文、附带�
 第一条评论兜底中查找受支持的网盘、磁力或 ed2k 链接；没有下载链接的普通微博不会返回。它不会
 遍历全部评论，也不会把任意普通网页链接作为结果输出。
 
-## Gying 和 Panlian
+## Gying
 
 ```bash
 pansou provider configure gying \
   --base-url https://www.xn--wcv59z.com
 pansou provider login gying --profile main --username USERNAME
-
-pansou provider login panlian --profile main --username USERNAME
-pansou provider configure panlian --blocked-cloud pikpak --blocked-cloud others
 ```
+
+Gying 登录成功后即可搜索。默认使用当前配置的 `base_url`；只有服务地址变化或使用镜像时才
+需要运行 `provider configure gying`。登录过程中需要完成服务端 challenge，可能会等待片刻。
 
 密码默认通过隐藏输入的 TTY 提示读取。自动化场景使用 `--password-stdin`：
 
@@ -117,15 +117,35 @@ printf '%s\n' "$PANSOU_LOGIN_PASSWORD" | \
   pansou provider login gying --profile main --username USERNAME --password-stdin
 ```
 
-PanSou 不提供明文 `--password` 参数，以免密码进入 shell history。需要保存账号密码时使用
-`--remember-credentials`，并先设置 `PANSOU_STATE_KEY`。
-
-Gying 和 Panlian 的配置示例：
+PanSou 不提供明文 `--password` 参数，以免密码进入 shell history。使用
+`--remember-credentials` 时必须先设置 `PANSOU_STATE_KEY`；凭据会加密保存，并在 Cookie
+失效时用于一次自动重新登录。不保存凭据时，需要手动重新运行 login。
 
 ```toml
 [providers.gying]
 base_url = "https://www.xn--wcv59z.com"
+```
 
+## Panlian
+
+```bash
+pansou provider login panlian --profile main --username USERNAME
+pansou provider configure panlian --blocked-cloud pikpak --blocked-cloud others
+```
+
+密码默认通过隐藏输入的 TTY 提示读取。自动化场景使用 `--password-stdin`：
+
+```bash
+printf '%s\n' "$PANSOU_LOGIN_PASSWORD" | \
+  pansou provider login panlian --profile main --username USERNAME --password-stdin
+```
+
+PanSou 不提供明文 `--password` 参数，以免密码进入 shell history。需要保存账号密码时使用
+`--remember-credentials`，并先设置 `PANSOU_STATE_KEY`。
+
+Panlian 的配置示例：
+
+```toml
 [providers.panlian]
 blocked_clouds = []
 ```
