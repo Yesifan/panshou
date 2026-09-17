@@ -163,6 +163,18 @@ fn gying_login_help_explains_ready_state_and_saved_credentials() {
 }
 
 #[test]
+fn panlian_login_help_explains_ready_state_and_optional_filter() {
+    let error =
+        Cli::try_parse_from(["pansou", "provider", "login", "panlian", "--help"]).unwrap_err();
+    let help = error.to_string();
+    assert!(help.contains("ready to search immediately after login"));
+    assert!(help.contains("filtering is optional and global across profiles"));
+    assert!(help.contains("provider configure panlian --blocked-cloud"));
+    assert!(help.contains("--remember-credentials requires PANSOU_STATE_KEY"));
+    assert!(help.contains("automatic login retry"));
+}
+
+#[test]
 fn qqpd_login_help_explains_scan_and_channel_setup() {
     let error = Cli::try_parse_from(["pansou", "provider", "login", "qqpd", "--help"]).unwrap_err();
     let help = error.to_string();

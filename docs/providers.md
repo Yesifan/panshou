@@ -133,6 +133,9 @@ pansou provider login panlian --profile main --username USERNAME
 pansou provider configure panlian --blocked-cloud pikpak --blocked-cloud others
 ```
 
+Panlian 登录成功后即可搜索。`blocked-cloud` 只是可选的全局过滤配置，不属于某个 profile；
+可重复指定该参数。本次命令会完整覆盖旧列表，不传 `--blocked-cloud` 会清空过滤。
+
 密码默认通过隐藏输入的 TTY 提示读取。自动化场景使用 `--password-stdin`：
 
 ```bash
@@ -140,8 +143,9 @@ printf '%s\n' "$PANSOU_LOGIN_PASSWORD" | \
   pansou provider login panlian --profile main --username USERNAME --password-stdin
 ```
 
-PanSou 不提供明文 `--password` 参数，以免密码进入 shell history。需要保存账号密码时使用
-`--remember-credentials`，并先设置 `PANSOU_STATE_KEY`。
+PanSou 不提供明文 `--password` 参数，以免密码进入 shell history。使用
+`--remember-credentials` 时必须先设置 `PANSOU_STATE_KEY`；凭据会加密保存，并在 Cookie
+失效时用于一次自动重新登录。不保存凭据时，需要手动重新运行 login。
 
 Panlian 的配置示例：
 

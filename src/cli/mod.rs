@@ -45,6 +45,7 @@ const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources
 const QQPD_LOGIN_GUIDANCE: &str = "Scan the QR code with the QQ mobile app and confirm on your phone. After login, configure at least one QQ channel with:\n  pansou provider configure qqpd add --profile <PROFILE> --channel <CHANNEL_ID_OR_PD_URL>\nOpen the channel in your browser and copy its https://pd.qq.com/g/<CHANNEL_ID> URL; either the channel ID or the full URL is accepted.";
 const QQPD_CHANNEL_GUIDANCE: &str = "Open the QQ channel in your browser and copy its URL. For example, https://pd.qq.com/g/example contains channel ID example. Either the channel ID or the full URL can be passed to --channel.";
 const GYING_LOGIN_GUIDANCE: &str = "Gying is ready to search immediately after login. It uses the configured provider base URL; change it only when the service moves or you use a mirror:\n  pansou provider configure gying --base-url <URL>\nPasswords are prompted securely by default. --remember-credentials requires PANSOU_STATE_KEY and allows one automatic login retry when the saved cookie expires.";
+const PANLIAN_LOGIN_GUIDANCE: &str = "Panlian is ready to search immediately after login. Cloud-drive filtering is optional and global across profiles:\n  pansou provider configure panlian --blocked-cloud <CLOUD>\nPasswords are prompted securely by default. --remember-credentials requires PANSOU_STATE_KEY and allows one automatic login retry when the saved cookie expires.";
 const WEIBO_LOGIN_GUIDANCE: &str = "Scan the QR code with the Weibo mobile app and confirm on your phone. After login, add at least one target user with:\n  pansou provider configure weibo add --profile <PROFILE> --user <UID_OR_PROFILE_URL>\nPansou returns keyword-matched posts only when a supported cloud-drive, magnet, or ed2k link is found in the post, a linked page, or the first comment fallback.";
 const WEIBO_USER_GUIDANCE: &str = "Open the target user's Weibo profile and copy its URL. For example, https://weibo.com/u/1234567890 contains UID 1234567890. Either the numeric UID or the full profile URL can be passed to --user.";
 
@@ -262,7 +263,7 @@ pub enum LoginProviderCommand {
     /// Username/password login.
     Gying(GyingLoginArgs),
     /// Username/password login.
-    Panlian(PasswordLoginArgs),
+    Panlian(PanlianLoginArgs),
 }
 
 #[derive(Debug, Args)]
@@ -289,24 +290,25 @@ pub struct WeiboLoginArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct PasswordLoginArgs {
+#[command(after_long_help = GYING_LOGIN_GUIDANCE)]
+pub struct GyingLoginArgs {
     /// Profile name for the saved session.
     #[arg(long, default_value = "main")]
     pub profile: String,
-    /// Account username, when required by the provider.
+    /// Account username.
     #[arg(long)]
     pub username: Option<String>,
     /// Read the account password from standard input instead of prompting.
     #[arg(long)]
     pub password_stdin: bool,
-    /// Remember credentials for providers that support automatic login.
+    /// Save encrypted credentials for one automatic login retry after cookie expiry.
     #[arg(long)]
     pub remember_credentials: bool,
 }
 
 #[derive(Debug, Args)]
-#[command(after_long_help = GYING_LOGIN_GUIDANCE)]
-pub struct GyingLoginArgs {
+#[command(after_long_help = PANLIAN_LOGIN_GUIDANCE)]
+pub struct PanlianLoginArgs {
     /// Profile name for the saved session.
     #[arg(long, default_value = "main")]
     pub profile: String,
@@ -1110,7 +1112,7 @@ async fn run_provider(
                         .collect::<Result<Vec<_>, _>>()?;
                     let provider =
                         PanlianProvider::load(store.clone(), PanlianEndpoints::default(), blocked)?;
-                    provider
+                    let login = provider
                         .login(
                             &session,
                             &args.profile,
@@ -1118,8 +1120,24 @@ async fn run_provider(
                             &password,
                             args.remember_credentials,
                         )
-                        .await?;
-                    println!("panlian/{}: logged in", args.profile);
+                        .await;
+                    match login {
+                        Ok(_) => {}
+                        Err(crate::core::ProviderError::AuthRequired) => {
+                            return Err(usage(
+                                "Panlian login failed; check the username and password",
+                            ));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                    println!("panlian/{}: logged in and ready", args.profile);
+                    println!(
+                        "Verify with: pansou provider status panlian --profile {}",
+                        args.profile
+                    );
+                    println!(
+                        "Optional global filter: pansou provider configure panlian --blocked-cloud <CLOUD>"
+                    );
                 }
             }
         }
