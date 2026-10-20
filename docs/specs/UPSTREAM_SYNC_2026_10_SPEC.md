@@ -2,9 +2,9 @@
 
 ---
 
-status: in-progress
-execution_time: "2026-10-20"
-commit: null
+status: completed
+execution_time: "2026-10-20 / 2026-10-20"
+commit: "6e0d4a872afce8cf00d29ead22892fcf8b9dd081"
 version: null
 related_documents:
   - "[Rust CLI v1 规格](RUST_CLI_V1_SPEC.md)"
@@ -36,7 +36,7 @@ related_documents:
 | 上游部署默认来源 | 66→71；注册但不默认启用为 `gying/kpkuang/qiwei/xdpan` |
 | 上游部署候选频道 | 最终 Docker/Compose 均为 111 个唯一频道 |
 
-**实现状态为 in-progress。** “已核查”不表示 Rust 已实现、测试已运行或第三方站点当前可用。原基准是旧规格的分析参考，不是历史完整同步验收证明。
+**实现状态为 completed。** 本次 Rust 实现、本地离线测试和五个发布平台 CI 验收均已完成，证据见下方实施记录；第三方站点当前可用性未作保证。原基准是旧规格的分析参考，不是历史完整同步验收证明。
 
 逐来源协议、调用位置、数值边界、测试契约、CLI 处置及逐文件映射均已写入[规范附录](upstream-sync-2026-10/CHANGE_LEDGER.md)。附录是本文组成部分，不是让实施者再次进行全量上游核查的占位台账；正文明确的产品/安全决策优先于附录中的建议。
 
@@ -207,11 +207,11 @@ related_documents:
 - **上游净差异已完整核查**；不存在“实施时再核查全部变更”的前置阶段。实施任务是按正文和规范附录开发、回归、处理现场新变化，不是继续填写空台账。
 - 用户已确认全部默认策略：新安装/无显式来源选择的升级采用上游默认集合与本次已接入来源的交集；默认集合中的新增有状态来源就绪后自动参与；上游移出默认的来源仍可显式使用；不覆盖用户显式选择，升级说明提示范围变化。当前无待决定事项。
 - 新fallback频道7仅影响无保存配置，显式清单不覆盖；停止上游注册的来源只提供显式选择，不自动启用。默认列表变更不删除旧jupansou等显式配置或凭据。
-- 规格编写阶段只写spec及已完成核查附录，没有实现协议、运行Go/Rust测试或live探测；附录中的测试结果描述为已阅读的断言，不是执行成功声明。后续实现与验证以实施记录及PR为准，未完成全部验收前状态保持in-progress。
+- 规格编写阶段只写spec及已完成核查附录，没有实现协议、运行Go/Rust测试或live探测；附录中的测试结果描述为已阅读的断言，不是执行成功声明。后续实现与验证见下方实施记录及PR。
 
 ## Implementation Record — 2026-10-20
 
 - Rust 注册来源为 106 个（原有 19 个更新、新接入 87 个），默认候选交集为 66 个；无已登录账号时默认参与 62 个。候选频道为 111 个。数量由离线 inventory/频道测试断言。
 - 本地 Linux x86_64 GNU 已通过 `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-features --no-fail-fast`（479 个单元测试、78 个集成测试，共 557 个通过）及 `cargo build --release`；release 二进制版本检查通过。
-- CI 已配置五个发布目标构建及原生更新器/迁移测试；实际结果以 PR checks 为准，不能用本地 GNU 构建替代 musl/macOS/Windows 验证。跨平台验收完成前状态保持 `in-progress`。
+- 实现提交 `6e0d4a872afce8cf00d29ead22892fcf8b9dd081` 的 [PR #1 CI](https://github.com/Yesifan/panshou/actions/runs/39392752990) 已全部通过：格式/lint/测试、Linux x86_64/aarch64 musl、macOS x86_64/aarch64、Windows x86_64 release 构建，以及原生更新器/迁移运行测试。2026-10-20 完成验收，状态更新为 `completed`。
 - 未运行第三方线上/真实账号验证；fixture/mock 通过不表示所有站点当前可用。未恢复 Go 服务、后台补搜或搜索缓存。
