@@ -1,6 +1,8 @@
 # Provider 配置
 
-PanSou 包含 19 个 provider：
+当前注册 106 个来源（101 个无状态、5 个有状态）。固定上游默认集合与已接入来源的交集为 66 个；
+全新安装尚未登录时，其中 62 个参与默认搜索，其余 4 个在就绪后加入。Gying 不属于默认集合。
+完整来源列表与就绪状态以 `pansou provider list` 为准。下表列出原有来源及需要登录的来源；新增无登录来源也通过同一命令发现和显式选择。
 
 | Provider | 登录 | 说明 |
 | --- | --- | --- |
@@ -22,7 +24,11 @@ PanSou 包含 19 个 provider：
 | qqpd | 扫码 | 多账号、频道配置 |
 | weibo | 扫码 | 多账号、目标用户配置 |
 | gying | 密码 | 多账号、三种 PoW challenge |
-| panlian | 密码 | 多账号、token/jump 解析 |
+| panlian | 密码、图形验证码，必要时核对绑定邮箱 | 多账号、现代 videos/ticket/open 搜索 |
+| woniu | 密码 | 独立 Cookie、可配置站点、电影及分集网盘链接 |
+
+`zhizhen` 的固定目标站点是 `http://www.mihdr.top`，使用明文 HTTP；不自动切换到 HTTPS 或轮询旧域名。
+来源可发现、默认启用、已登录和第三方站点当前可用是不同概念；默认测试不作线上可用性保证。
 
 ## 管理命令
 
@@ -34,8 +40,16 @@ pansou provider status qqpd --profile main
 pansou provider logout qqpd --profile main
 ```
 
-普通搜索会静默跳过尚未配置 profile 的有状态 provider；显式选择该 provider 时会返回
-需要登录的错误。
+默认来源采用固定目标上游默认集合与 CLI 已接入来源的交集；其中需要登录的来源未就绪时静默跳过。
+登录不会把非默认来源自动加入默认搜索；Gying、Jupansou、Kpkuang 等仍可通过 `--provider` 或显式配置选择。
+已有显式来源清单（包括空清单）不追加、不删除；未显式选择的升级用户默认搜索范围和请求量可能扩大。
+显式选择未就绪的有状态 provider 时会返回需要登录的错误。
+
+## Miaoso
+
+`miaoso` 可通过环境变量 `PANSOU_MIAOSO_TOKEN` 接收用户自己的 `satoken`，仅在本次进程中使用，
+不写入配置或状态文件。不要把 token 放入命令行参数或提交到仓库；程序不内置上游源码中的会话凭据。
+未设置或为空时不发送 `satoken`，站点是否允许匿名搜索由第三方服务决定。
 
 ## QQPD
 
@@ -61,7 +75,9 @@ pansou provider configure qqpd del --profile main --channel pd97631607
 指定频道，`list` 显示当前频道；删除最后一个频道不会注销 profile，但它不会参与搜索。打开
 QQ 频道网页版并复制
 `https://pd.qq.com/g/<频道ID>` 地址；`--channel` 既接受频道 ID，也接受完整 URL。频道会被
-规范化和去重，并缓存 `guild_id`。QQPD 在搜索前按需执行 session keepalive。
+规范化和去重，并通过官方 gotrpc 解析及持久化 `guild_id`；旧索引在搜索前按需修复。
+仅明确“频道不存在”的 code10003 按 profile 连续两次隔离，成功复位；传输、权限和未知错误不删除频道。
+重新执行该 profile 的 `configure qqpd add` 可恢复隔离目标。QQPD 在搜索前按需执行 session keepalive。
 
 ## Weibo
 
@@ -133,19 +149,14 @@ pansou provider login panlian --profile main --username USERNAME
 pansou provider configure panlian --blocked-cloud pikpak --blocked-cloud others
 ```
 
-Panlian 登录成功后即可搜索。`blocked-cloud` 只是可选的全局过滤配置，不属于某个 profile；
-可重复指定该参数。本次命令会完整覆盖旧列表，不传 `--blocked-cloud` 会清空过滤。
+登录时先获取图形验证码，终端提示打开私有临时图片并输入图片中的字符；如站点要求，再输入账号已绑定的邮箱核对。
+这不是邮件 OTP，未完成核对不会保存为 active。空输入取消，图片随登录流程结束删除。
+密码默认通过隐藏输入的 TTY 提示读取。非 TTY 输入必须显式传 `--interactive`；配合
+`--password-stdin` 时第一行是密码，后续按提示输入验证码与必要的绑定邮箱，不能只管道传入密码就视为完成登录。
+Panlian 不保存密码，`--remember-credentials` 已拒绝；Cookie 过期后必须人工重新登录。
 
-密码默认通过隐藏输入的 TTY 提示读取。自动化场景使用 `--password-stdin`：
-
-```bash
-printf '%s\n' "$PANSOU_LOGIN_PASSWORD" | \
-  pansou provider login panlian --profile main --username USERNAME --password-stdin
-```
-
-PanSou 不提供明文 `--password` 参数，以免密码进入 shell history。使用
-`--remember-credentials` 时必须先设置 `PANSOU_STATE_KEY`；凭据会加密保存，并在 Cookie
-失效时用于一次自动重新登录。不保存凭据时，需要手动重新运行 login。
+登录成功后即可搜索。`blocked-cloud` 是跨 profile 的可选全局过滤；可重复指定，命令完整覆盖旧列表，
+不传 `--blocked-cloud` 会清空过滤。
 
 Panlian 的配置示例：
 
@@ -153,6 +164,19 @@ Panlian 的配置示例：
 [providers.panlian]
 blocked_clouds = []
 ```
+
+## Woniu
+
+```bash
+pansou provider login woniu --profile main --username USERNAME
+pansou provider status woniu --profile main
+pansou provider configure woniu --base-url https://wn4k.com
+pansou provider logout woniu --profile main
+```
+
+密码使用隐藏 TTY 提示或 `--password-stdin`，不会保存。登录后保留独立 Cookie；状态检查按需验证会话。
+只有真实修改站点才使已有会话失效并要求重登，不把旧站 Cookie 发送到新站或跨站重定向。
+退出会通知站点，即使站点不可用也删除本地会话。游客锁定占位链接不作为搜索结果。
 
 ## 状态与凭据安全
 

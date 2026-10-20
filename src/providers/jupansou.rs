@@ -149,15 +149,15 @@ async fn exchange(
     if !cookie.is_empty() {
         request = request.header("cookie", cookie);
     }
-    let raw = request
-        .send()
-        .await
-        .map_err(|e| ProviderError::Network(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| ProviderError::Network(e.to_string()))?
-        .text()
-        .await
-        .map_err(|e| ProviderError::Network(e.to_string()))?;
+    let raw = crate::providers::b_registry::http::text(
+        request,
+        3,
+        200,
+        true,
+        std::time::Duration::from_secs(15),
+        16 << 20,
+    )
+    .await?;
     transfer(&raw)
 }
 #[async_trait]
@@ -179,18 +179,19 @@ impl Provider for Jupansou {
             .join("api/search/session")
             .map_err(|e| ProviderError::Protocol(e.to_string()))?;
         let referer = format!("{}/", self.endpoints.base.as_str().trim_end_matches('/'));
-        let session = ctx
-            .client
-            .get(session_url)
-            .header("user-agent", UA)
-            .header("accept", "application/json, text/plain, */*")
-            .header("referer", &referer)
-            .header("x-requested-with", "XMLHttpRequest")
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let session = crate::providers::b_registry::http::response(
+            ctx.client
+                .get(session_url)
+                .header("user-agent", UA)
+                .header("accept", "application/json, text/plain, */*")
+                .header("referer", &referer)
+                .header("x-requested-with", "XMLHttpRequest"),
+            3,
+            200,
+            true,
+            std::time::Duration::from_secs(15),
+        )
+        .await?;
         let cookie = session
             .headers()
             .get_all(reqwest::header::SET_COOKIE)
@@ -221,15 +222,19 @@ impl Provider for Jupansou {
         if !cookie.is_empty() {
             request = request.header("cookie", &cookie);
         }
-        let body = request
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .text()
+        // Drain and bound the session response before proceeding with its cookie.
+        crate::http::read_response(session, 16 << 20)
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let body = crate::providers::b_registry::http::text(
+            request,
+            3,
+            200,
+            true,
+            std::time::Duration::from_secs(15),
+            16 << 20,
+        )
+        .await?;
         let q = query.to_lowercase();
         let items = sse(&body)
             .into_iter()
@@ -238,12 +243,20 @@ impl Provider for Jupansou {
         let base = self.endpoints.base.clone();
         let client = ctx.client.clone();
         let cookie = cookie.clone();
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let errors_ref = errors.clone();
         let rows = stream::iter(items.into_iter().map(|item| {
             let base = base.clone();
             let client = client.clone();
             let cookie = cookie.clone();
+            let errors = errors_ref.clone();
             async move {
-                let d = exchange(&client, &base, &cookie, &item).await.ok()?;
+                let d = exchange(&client, &base, &cookie, &item)
+                    .await
+                    .inspect_err(|e| {
+                        errors.lock().unwrap().push(e.to_string());
+                    })
+                    .ok()?;
                 let mut link = Link::new(d.share_url.trim());
                 if matches!(link.cloud_type, crate::core::CloudType::Others) {
                     link.cloud_type = item_type(&item);
@@ -257,7 +270,7 @@ impl Provider for Jupansou {
                     d.file_name.trim().into()
                 });
                 let id = format!("jupansou-{:x}", md5::compute(link.url.as_bytes()));
-                Some(SearchResult {
+                let result = SearchResult {
                     id,
                     source: Source::provider("jupansou"),
                     datetime: Some(Utc::now()),
@@ -266,12 +279,21 @@ impl Provider for Jupansou {
                     tags: vec![link.cloud_type.to_string()],
                     links: vec![link],
                     images: vec![],
-                })
+                };
+                ctx.publish(vec![result.clone()]);
+                Some(result)
             }
         }))
         .buffered(8)
         .collect::<Vec<_>>()
         .await;
+        let failures = errors.lock().unwrap();
+        if let Some(error) = failures.first() {
+            return Err(ProviderError::Unavailable(format!(
+                "jupansou {} transfers failed: {error}",
+                failures.len()
+            )));
+        }
         let mut seen = std::collections::HashSet::new();
         Ok(rows
             .into_iter()

@@ -147,31 +147,30 @@ impl Provider for YunsouProvider {
                 .base
                 .join(&path)
                 .map_err(|e| ProviderError::Protocol(e.to_string()))?;
-            let response = tokio::time::timeout(
-                ctx.timeout,
-                ctx.client
-                    .get(url)
-                    .header(reqwest::header::REFERER, self.endpoints.base.as_str())
-                    .send(),
+            let body = super::c_support::request(
+                || {
+                    ctx.client
+                        .get(url.clone())
+                        .timeout(ctx.timeout.min(std::time::Duration::from_secs(30)))
+                        .header(reqwest::header::REFERER, self.endpoints.base.as_str())
+                },
+                3,
+                std::time::Duration::from_millis(200),
+                super::c_support::BODY_LIMIT,
             )
-            .await
-            .map_err(|_| ProviderError::Timeout)?
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
-            if !response.status().is_success() {
-                if page == 1 {
-                    return Err(ProviderError::Protocol(format!(
-                        "HTTP {}",
-                        response.status()
-                    )));
-                }
-                break;
+            .await;
+            let body = match body {
+                Ok(body) => body,
+                Err(ProviderError::Timeout) => return Err(ProviderError::Timeout),
+                Err(error) if page == 1 => return Err(error),
+                Err(error) => return Err(error),
+            };
+            let (mut rows, total) = parse_page(&String::from_utf8_lossy(&body))?;
+            rows.truncate(100usize.saturating_sub(all.len()));
+            ctx.publish(rows.clone());
+            if !ctx.publish(rows.clone()) {
+                return Err(ProviderError::Timeout);
             }
-            let (mut rows, total) = parse_page(
-                &response
-                    .text()
-                    .await
-                    .map_err(|e| ProviderError::Network(e.to_string()))?,
-            )?;
             all.append(&mut rows);
             if page * 10 >= total || all.len() >= 100 {
                 break;
@@ -184,6 +183,67 @@ impl Provider for YunsouProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn retries_first_page_and_retains_results_when_later_page_fails() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let n = count.clone();
+        Mock::given(path("/s/movie.html"))
+            .respond_with(move |_: &wiremock::Request| {
+                if n.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_string(
+                        include_str!("../../tests/fixtures/providers/yunsou/success.html")
+                            .replace(":total=\"1\"", ":total=\"20\""),
+                    )
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(path("/s/movie-2.html"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let provider = YunsouProvider::new(Endpoints {
+            base: Url::parse(&server.uri()).unwrap(),
+        });
+        let ctx = SearchContext::new(reqwest::Client::new(), Duration::from_secs(5));
+        let error = provider.search(&ctx, "movie").await.unwrap_err();
+        assert_eq!(error.to_string(), "provider protocol error: HTTP 503");
+        assert_eq!(ctx.finish(Vec::new()).len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+    #[tokio::test]
+    async fn exhausted_first_page_is_status_error() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let provider = YunsouProvider::new(Endpoints {
+            base: Url::parse(&server.uri()).unwrap(),
+        });
+        let ctx = SearchContext::new(reqwest::Client::new(), std::time::Duration::from_secs(5));
+        assert!(
+            provider
+                .search(&ctx, "movie")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("503")
+        );
+    }
     #[test]
     fn success() {
         let (r, t) = parse_page(include_str!(

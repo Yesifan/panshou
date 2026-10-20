@@ -1,8 +1,27 @@
+trait ExecuteRequest {
+    async fn execute(self) -> anyhow::Result<reqwest::Response>;
+}
+impl ExecuteRequest for reqwest::RequestBuilder {
+    async fn execute(self) -> anyhow::Result<reqwest::Response> {
+        crate::http::execute(self).await
+    }
+}
+
+async fn read_text(response: reqwest::Response) -> anyhow::Result<String> {
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(anyhow::anyhow!("clxiong HTTP {status}"));
+    }
+    let body = crate::http::read_response(response, 16 * 1024 * 1024)
+        .await
+        .map_err(|error| error.context(format!("clxiong response body HTTP {status}")))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 use crate::core::{Link, ProviderError, SearchResult, Source};
 use crate::providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext};
 use async_trait::async_trait;
 use chrono::{NaiveDate, Utc};
-use futures::future::join_all;
 use regex::Regex;
 use scraper::{Html, Selector};
 use url::Url;
@@ -49,8 +68,9 @@ struct Item {
     detail: Url,
 }
 fn search_id(location: &str) -> Option<String> {
-    Regex::new(r"searchid=(\d+)")
-        .ok()?
+    static SEARCH_ID: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"searchid=(\d+)").unwrap());
+    SEARCH_ID
         .captures(location)?
         .get(1)
         .map(|m| m.as_str().to_owned())
@@ -64,8 +84,12 @@ fn parse_results(body: &str, base: &Url) -> Result<Vec<Item>, ProviderError> {
     let rank = Selector::parse(".rank").expect("selector");
     let small = Selector::parse(".small").expect("selector");
     let image = Selector::parse(".card-img").expect("selector");
-    let image_re = Regex::new(r#"url\(['\"]?([^'\")]+)"#).expect("regex");
-    let id_re = Regex::new(r"/(?:drama|movie)/(\d+)\.html").expect("regex");
+    static IMAGE_RE_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r#"url\(['\"]?([^'\")]+)"#).expect("regex"));
+    let image_re = &*IMAGE_RE_RE;
+    static ID_RE_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"/(?:drama|movie)/(\d+)\.html").expect("regex"));
+    let id_re = &*ID_RE_RE;
     let mut out = Vec::new();
     for card in doc.select(&cards).take(30) {
         let Some(a) = card.select(&anchors).next() else {
@@ -145,7 +169,10 @@ fn parse_detail(
         });
         out.push(link)
     }
-    let date_re = Regex::new(r"最后更新于：?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})").expect("regex");
+    static DATE_RE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"最后更新于：?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})").expect("regex")
+    });
+    let date_re = &*DATE_RE_RE;
     let datetime = doc.select(&detail).find_map(|p| {
         date_re
             .captures(&p.text().collect::<String>())
@@ -185,11 +212,14 @@ impl Provider for ClxiongProvider {
                     "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 )
                 .form(&form)
-                .send(),
+                .execute(),
         )
         .await
         .map_err(|_| ProviderError::Timeout)?
         .map_err(|e| ProviderError::Network(e.to_string()))?;
+        if first.status().is_client_error() || first.status().is_server_error() {
+            return Err(ProviderError::Protocol(format!("HTTP {}", first.status())));
+        }
         let location = first
             .headers()
             .get(reqwest::header::LOCATION)
@@ -197,13 +227,14 @@ impl Provider for ClxiongProvider {
             .unwrap_or(first.url().as_str());
         let sid = search_id(location)
             .ok_or_else(|| ProviderError::Protocol("redirect did not contain searchid".into()))?;
+        drop(first);
         let url = self
             .endpoints
             .base
             .join(&format!("e/search/result/?searchid={sid}"))
             .map_err(|e| ProviderError::Protocol(e.to_string()))?;
         let response = request(&ctx.client, url, &self.endpoints.base)
-            .send()
+            .execute()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
         if !response.status().is_success() {
@@ -213,22 +244,30 @@ impl Provider for ClxiongProvider {
             )));
         }
         let items = parse_results(
-            &response
-                .text()
+            &read_text(response)
                 .await
                 .map_err(|e| ProviderError::Network(e.to_string()))?,
             &self.endpoints.base,
         )?;
         let jobs = items.into_iter().map(|item| async move {
             let response = request(&ctx.client, item.detail, &self.endpoints.base)
-                .send()
+                .execute()
                 .await
-                .ok()?;
-            let (links, datetime) = parse_detail(&response.text().await.ok()?, &item.title).ok()?;
-            if links.is_empty() {
-                return None;
+                .map_err(super::c_support::network)?;
+            if response.status() != reqwest::StatusCode::OK {
+                return Err(ProviderError::Protocol(format!(
+                    "clxiong detail HTTP {}",
+                    response.status()
+                )));
             }
-            Some(SearchResult {
+            let body = read_text(response)
+                .await
+                .map_err(super::c_support::network)?;
+            let (links, datetime) = parse_detail(&body, &item.title)?;
+            if links.is_empty() {
+                return Ok(None);
+            }
+            Ok::<_, ProviderError>(Some(SearchResult {
                 id: item.id,
                 source: Source::provider("clxiong"),
                 datetime,
@@ -237,14 +276,68 @@ impl Provider for ClxiongProvider {
                 links,
                 tags: vec!["磁力链接".into(), "影视".into()],
                 images: item.images,
-            })
+            }))
         });
-        Ok(join_all(jobs).await.into_iter().flatten().collect())
+        super::collect_partial(ctx, jobs, 6).await
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn detail_status_is_preserved_and_completed_rows_survive() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        let fixture = include_str!("../../tests/fixtures/providers/clxiong/success.html");
+        Mock::given(method("POST"))
+            .and(path("/e/search/index.php"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "/result?searchid=1"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/e/search/result/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{fixture}{}", fixture.replace("4466", "9999"))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/drama/4466.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(include_str!(
+                "../../tests/fixtures/providers/clxiong/detail.html"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(path("/drama/9999.html"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base: Url = server.uri().parse().unwrap();
+        let provider = ClxiongProvider::new(Endpoints {
+            base: base.clone(),
+            search: base.join("e/search/index.php").unwrap(),
+        });
+        let options = crate::http::ClientOptions {
+            redirect: crate::http::RedirectPolicy::None,
+            ..Default::default()
+        };
+        let client = crate::http::HttpClientFactory::new()
+            .client(&options)
+            .unwrap();
+        let ctx = SearchContext::new(client, std::time::Duration::from_secs(5));
+        let error = provider.search(&ctx, "一人之下").await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error}");
+        let rows = ctx.finish(Vec::new());
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].links.is_empty());
+    }
+
     #[test]
     fn success() {
         let b = Url::parse("https://www.cilixiong.org/").unwrap();

@@ -1,3 +1,20 @@
+trait ExecuteRequest {
+    async fn execute(self) -> anyhow::Result<reqwest::Response>;
+}
+impl ExecuteRequest for reqwest::RequestBuilder {
+    async fn execute(self) -> anyhow::Result<reqwest::Response> {
+        crate::http::execute(self).await
+    }
+}
+
+async fn read_text(response: reqwest::Response) -> anyhow::Result<String> {
+    let status = response.status();
+    let body = crate::http::read_response(response, 16 * 1024 * 1024)
+        .await
+        .map_err(|e| anyhow::anyhow!("dyyj response body HTTP {status}: {e}"))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 use crate::core::{CloudType, Link, ProviderError, SearchResult, Source};
 use crate::providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext};
 use async_trait::async_trait;
@@ -110,7 +127,10 @@ fn parse_response(body: &str) -> Result<Vec<SearchResult>, ProviderError> {
 fn extract_links(content: &str) -> Vec<Link> {
     let doc = Html::parse_fragment(content);
     let selector = Selector::parse("a[href]").expect("selector");
-    let pwd = Regex::new(r"(?i)(?:提取码|密码|pwd)\s*[=:：]?\s*([A-Za-z0-9]{4,8})").expect("regex");
+    static PWD_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)(?:提取码|密码|pwd)\s*[=:：]?\s*([A-Za-z0-9]{4,8})").expect("regex")
+    });
+    let pwd = &*PWD_RE;
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for a in doc.select(&selector) {
@@ -183,7 +203,7 @@ impl Provider for DyyjProvider {
                 )
                 .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
                 .header(reqwest::header::REFERER, self.endpoints.base.as_str())
-                .send(),
+                .execute(),
         )
         .await
         .map_err(|_| ProviderError::Timeout)?
@@ -195,8 +215,7 @@ impl Provider for DyyjProvider {
             )));
         }
         parse_response(
-            &response
-                .text()
+            &read_text(response)
                 .await
                 .map_err(|e| ProviderError::Network(e.to_string()))?,
         )
@@ -205,6 +224,13 @@ impl Provider for DyyjProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn password_accepts_spaces_and_tabs() {
+        for label in ["提取码  ：  Ab12", "密码\t：\tAb12", "pwd\t=\tAb12"] {
+            let html = format!("<p><a href=\"https://pan.quark.cn/s/abc\">下载</a>{label}</p>");
+            assert_eq!(extract_links(&html)[0].password.as_deref(), Some("Ab12"));
+        }
+    }
     #[test]
     fn success() {
         let r = parse_response(include_str!(

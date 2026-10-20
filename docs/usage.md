@@ -41,8 +41,9 @@ pansou search "仙逆" --format json
 pansou search "仙逆" --no-check --format json
 ```
 
-默认搜索独立频道清单中启用的 Telegram 频道、15 个无登录 provider，以及已经配置且登录有效的
-有状态 provider。TG 与 provider 共享默认 8 个并发名额，每个来源超时默认 30 秒，
+默认搜索独立频道清单中启用的 Telegram 频道，以及固定上游默认集合中已接入且就绪的 provider。
+需要登录的默认来源在 profile 就绪后参与，未就绪时静默跳过；登录不自动选择非默认来源。
+升级保留显式来源清单，未显式选择来源时新版默认搜索范围和请求量可能扩大。TG 与 provider 共享默认 8 个并发名额，每个来源超时默认 30 秒，
 取得名额后开始计时，不含排队。`--all-timeout` 默认 600 秒，包含排队与来源请求；
 到期取消剩余搜索并保留已收到的结果。初始化和链接检测不计入该时限。Provider 的登录和配置参见
 [Provider 配置](providers.md)。
@@ -75,7 +76,8 @@ TG 每频道只请求一次公开搜索页，不翻页、不自动重试；解�
 min(ceil((provider 数 + channel 数) / jobs) × timeout, all-timeout)
 ```
 
-例如 15 个 provider 加 128 个频道，8 并发、30 秒单来源超时，估算约 9 分钟。
+例如全新安装的 62 个免登录默认 provider 加 128 个频道，8 并发、30 秒单来源超时，
+按批次计算为 720 秒，但默认总截止为 600 秒，因此显示约 10 分钟。
 该值不包含初始化、处理开销或检测，不会为计算帮助信息发送网络请求。
 
 ## Telegram 频道管理
@@ -127,7 +129,7 @@ name = "foo"
 enabled = true
 ```
 
-文件不存在时使用初始默认频道 `tgsearchers3`；显式空清单或全部禁用表示不搜索任何默认频道。
+文件不存在时使用初始默认频道 `tgsearchers7`（升级不覆盖已保存的 `tgsearchers3`、禁用项或显式空清单）；显式空清单或全部禁用表示不搜索任何默认频道。
 本次频道选择优先级为 `--channel` > `PANSOU_CHANNELS` > `CHANNELS` > 独立清单启用项。
 各层整体覆盖；本次显式选择去重后也不能超过 128。搜索过程确认某个已保存的启用频道
 是 bot、已删除或没有公开消息归档时，会自动将其设为 disabled 并在 stderr 提示。
@@ -204,7 +206,9 @@ pansou check [URL]...
 ## 支持的链接类型
 
 搜索和解析支持：Baidu、Aliyun、Quark、Guangya、Tianyi、UC、Mobile、115、PikPak、
-Xunlei、123、magnet、ed2k 和 others。链接检测只覆盖上一节列出的 9 种类型。
+Xunlei、123、Weiyun（`weiyun`）、Lanzou（`lanzou`）、magnet、ed2k 和 others。
+链接检测仍只覆盖上一节列出的 9 种类型；微云、蓝奏检测明确返回 `unsupported`，默认搜索会过滤，
+使用 `--no-check --cloud weiyun` 或 `--no-check --cloud lanzou` 可保留并筛选这些链接。
 
 ## 代理
 
@@ -215,8 +219,9 @@ pansou search "仙逆" --proxy http://127.0.0.1:7890
 pansou check URL --proxy socks5://127.0.0.1:1080
 ```
 
-也可以在配置文件中设置 `network.proxy`，或使用 `PANSOU_PROXY`。代理不会自动启用，
-必须由用户明确配置。
+也可以在配置文件中设置 `network.proxy`，或使用 `PANSOU_PROXY`；兼容 `PROXY`、
+`HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY` 及对应小写环境变量，显式代理也遵守 `NO_PROXY`/`no_proxy`。
+SOCKS5/SOCKS5H 保留库的 DNS 语义。`config show` 和诊断不展示代理账号密码。
 
 ## 配置
 
@@ -237,6 +242,8 @@ timeout_secs = 30
 [search]
 jobs = 8
 all_timeout_secs = 600
+# Optional explicit selection: omit providers to follow the built-in defaults.
+# An explicit list is preserved on upgrade; [] disables provider search.
 providers = [
   "pansearch", "yunsou", "djgou", "hdmoli", "meitizy",
   "yulinshufa", "clxiong", "jsnoteclub", "duanjuw", "dyyj",
@@ -250,7 +257,7 @@ jobs = 8
 
 配置优先级为：命令行参数 > `PANSOU_*` 环境变量 > `config.toml` > 默认值。主要环境
 变量为 `PANSOU_PROXY`、`PANSOU_ALL_TIMEOUT_SECS`、`PANSOU_CHANNELS` 和 `PANSOU_PROVIDERS`；旧的 `PROXY`、
-`HTTP_PROXY`、`HTTPS_PROXY`、`CHANNELS` 和 `ENABLED_PLUGINS` 仅作为 fallback。
+`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`（以及小写形式）、`CHANNELS` 和 `ENABLED_PLUGINS` 仅作为 fallback。
 
 PanSou 使用操作系统标准目录，而不是当前工作目录：
 
@@ -270,7 +277,7 @@ PanSou 使用操作系统标准目录，而不是当前工作目录：
 | ---: | --- |
 | 0 | 成功，或部分搜索来源失败但至少一个来源成功 |
 | 2 | CLI 参数或配置错误 |
-| 3 | 所有选中的搜索来源均失败 |
+| 3 | 没有完整成功的来源（即使保留了未完成来源的部分链接） |
 | 4 | 显式选择的 provider 需要登录 |
 | 5 | 全局网络或初始化错误 |
 | 10 | `check --fail-invalid` 发现 `bad` 或 `locked` |

@@ -1,5 +1,5 @@
-# Source: https://github.com/fish2018/pansou/blob/main/Dockerfile
-# Retrieved 2026-09-15. Candidate list only; availability is not verified.
+# Source: https://github.com/fish2018/pansou/blob/221665fb2c9279f22af4684ea2d8c0c331eac1cc/Dockerfile
+# Verified 2026-10-20. Candidate list only; availability is not verified.
 tgsearchers7
 Aliyun_4K_Movies
 yunpanx
@@ -110,3 +110,4 @@ alyp_17362
 baidyunpan
 yunpans
 rbzhwpzy
+Panzi88com

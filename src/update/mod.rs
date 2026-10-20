@@ -132,29 +132,15 @@ impl UpdateClient {
     }
 
     async fn download(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
-        let mut response = self
-            .client
-            .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-            .map_err(|e| e.without_url())?
-            .error_for_status()
-            .map_err(|e| e.without_url())?;
-        if response
-            .content_length()
-            .is_some_and(|len| len > limit as u64)
-        {
-            bail!("download exceeds size limit");
-        }
-        let mut data = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| e.without_url())? {
-            if data.len() + chunk.len() > limit {
-                bail!("download exceeds size limit");
-            }
-            data.extend_from_slice(&chunk);
-        }
-        Ok(data)
+        let response = crate::http::execute(
+            self.client
+                .get(url)
+                .header("Accept", "application/vnd.github+json"),
+        )
+        .await?
+        .error_for_status()
+        .map_err(|e| e.without_url())?;
+        crate::http::read_response(response, limit).await
     }
 
     pub async fn install(&self, plan: &UpdatePlan, config_dir: &Path) -> Result<InstallOutcome> {
@@ -618,6 +604,49 @@ mod tests {
             other => panic!("unexpected outcome: {other:?}"),
         }
         assert_eq!(fs::read(target).unwrap(), script);
+    }
+
+    #[tokio::test]
+    async fn downloads_enforce_encoded_and_decoded_limits() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        for (endpoint, length) in [("/exact", 64), ("/overflow", 65)] {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&vec![b'a'; length]).unwrap();
+            Mock::given(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Encoding", "gzip")
+                        .set_body_bytes(encoder.finish().unwrap()),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(path("/raw-overflow"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; 65]))
+            .mount(&server)
+            .await;
+        let client = crate::http::HttpClientFactory::new()
+            .client(&crate::http::ClientOptions::default())
+            .unwrap();
+        let updater = UpdateClient::with_api(client, server.uri());
+        assert_eq!(
+            updater
+                .download(&format!("{}/exact", server.uri()), 64)
+                .await
+                .unwrap(),
+            vec![b'a'; 64]
+        );
+        for endpoint in ["overflow", "raw-overflow"] {
+            assert!(
+                updater
+                    .download(&format!("{}/{endpoint}", server.uri()), 64)
+                    .await
+                    .unwrap_err()
+                    .is::<crate::http::ResponseTooLarge>()
+            );
+        }
     }
 
     #[test]

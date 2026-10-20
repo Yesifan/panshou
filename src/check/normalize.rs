@@ -90,41 +90,7 @@ impl FromStr for CheckCloudType {
 }
 
 pub fn detect_check_cloud_type(raw: &str) -> CheckCloudType {
-    let host = Url::parse(raw)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-        .unwrap_or_default();
-    if host.contains("aliyundrive.com") || host.contains("alipan.com") {
-        CheckCloudType::Aliyun
-    } else if host.contains("quark.cn") {
-        CheckCloudType::Quark
-    } else if host.contains("drive.uc.cn") {
-        CheckCloudType::Uc
-    } else if host.contains("pan.baidu.com") {
-        CheckCloudType::Baidu
-    } else if host.contains("cloud.189.cn") {
-        CheckCloudType::Tianyi
-    } else if host.contains("123pan")
-        || [
-            "123684.com",
-            "123685.com",
-            "123912.com",
-            "123592.com",
-            "123865.com",
-        ]
-        .contains(&host.as_str())
-    {
-        CheckCloudType::Pan123
-    } else if host.contains("pan.xunlei.com") {
-        CheckCloudType::Xunlei
-    } else if host.contains("115.com") || host.contains("115cdn.com") || host.contains("anxia.com")
-    {
-        CheckCloudType::One15
-    } else if host.contains("139.com") || host.contains("feixin.10086.cn") {
-        CheckCloudType::Mobile
-    } else {
-        CheckCloudType::Unsupported
-    }
+    crate::core::detect_cloud_type(raw).into()
 }
 
 /// Canonicalize without discarding provider-specific path/fragment information.

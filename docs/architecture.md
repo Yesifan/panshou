@@ -7,7 +7,7 @@
 
 ## 1. 设计目标
 
-PanSou 是本地运行的异步 CLI，不提供 HTTP Server。它把 Telegram 和 19 个
+PanSou 是本地运行的异步 CLI，不提供 HTTP Server。它把 Telegram 和内置
 provider 的搜索结果统一为核心数据模型，再完成过滤、排序、网盘链接去重和可选的
 有效性检测。搜索期间在交互式终端显示动态进度，完成后输出最终 table 或 JSON；
 独立检测同样输出 table 或 JSON。
@@ -37,7 +37,7 @@ provider 的搜索结果统一为核心数据模型，再完成过滤、排序�
                   |                 |
        +----------+----------+      +---- cloud checkers
        |                     |
- TelegramSource       Provider trait (19 implementations)
+ TelegramSource       Provider trait + explicit registries
        |                     |
        +----------+----------+
                   |
@@ -126,9 +126,13 @@ pub trait Provider: Send + Sync {
 }
 ```
 
-`ProviderMeta` 描述名称、优先级、认证类型和关键词过滤职责。registry 显式注册 15 个
-无登录 provider；CLI 再从 `StateStore` 加载已就绪的 QQPD、Weibo、Gying 和 Panlian
-profile。显式注册避免仅增加文件却遗漏运行时接线。
+`ProviderMeta` 描述名称、优先级、认证类型和关键词过滤职责。分组 registry 显式注册
+无登录 provider；CLI 再从 `StateStore` 加载已就绪的 QQPD、Weibo、Gying、Panlian 和 Woniu
+profile，最终仍由配置的来源清单选择。显式注册避免仅增加文件却遗漏运行时接线。
+
+`SearchContext` 为每个实际开始的来源分配唯一 deadline 和隔离的增量收集器；`publish` 交付已解析成果。
+正常返回与已发布成果合并去重，超时/取消时先冻结快照再 drop 未完成 future；冻结后拒绝继续写入。
+保留部分链接不等于来源完整成功，终态与退出码按来源完成情况计算。
 
 provider 内部只负责站点协议、请求头、分页和页面/API 解析，并返回核心模型。站点地址以
 endpoint 结构或构造参数注入，便于 fixture/mock server 测试。状态型 provider 的认证、
@@ -163,7 +167,10 @@ Redb 仅作为 check cache 使用。不同状态有不同 TTL；独立 `check` �
 - UTF-8 及 provider 明确指定的 GBK 等响应编码。
 
 `Session` 封装专属 cookie jar，不在 `Debug` 中暴露 cookie。provider 不应自行建立绕过
-这些策略的全局客户端。
+这些策略的全局客户端。所有真实请求通过 `http::execute` 共用默认 128 个出站名额，
+名额保持到响应体读取完成或丢弃；等待、重试退避和读取均随所属 future 取消。
+工厂关闭自动解压，由有界读取分别约束原始正文（默认 16 MiB）和解压输出（绝对 64 MiB、
+已知压缩长度时还受压缩比约束）；TG 2 MiB 与来源专用更小上限优先，超限明确报错而非 EOF。
 
 ### 3.7 State (`src/state`)
 
@@ -256,7 +263,7 @@ auth required、rate limited、blocked、protocol 和 unavailable。CLI 边界�
 | ---: | --- |
 | 0 | 成功，或搜索仅部分来源失败 |
 | 2 | CLI 参数、配置或可解析的输入错误 |
-| 3 | 所有选定搜索来源失败 |
+| 3 | 没有完整成功的来源，即使有截止前部分成果 |
 | 4 | 显式选择的 provider 需要认证 |
 | 5 | 全局初始化或网络设施错误 |
 | 10 | `check --fail-invalid` 检测到 `bad`/`locked` |

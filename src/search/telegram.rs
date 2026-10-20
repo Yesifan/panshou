@@ -5,7 +5,8 @@ use url::Url;
 use crate::channel::{ChannelPageKind, classify_channel_page};
 use crate::core::{
     Link, ProviderError, SearchResult, Source, associate_work_titles, canonical_url_key,
-    extract_links, extract_password,
+    extract_links,
+    link::{extract_password_for_link, message_title_line},
 };
 
 #[derive(Debug, Clone)]
@@ -38,10 +39,7 @@ impl TelegramSource {
             .join(&format!("s/{channel}"))
             .map_err(|error| ProviderError::Protocol(error.to_string()))?;
         url.query_pairs_mut().append_pair("q", query);
-        let response = self
-            .client
-            .get(url)
-            .send()
+        let response = crate::http::execute(self.client.get(url))
             .await
             .map_err(|error| ProviderError::Network(error.to_string()))?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -62,10 +60,14 @@ impl TelegramSource {
                 response.status()
             )));
         }
-        let body = response
-            .text()
+        let body = crate::http::read_response(response, 2 * 1024 * 1024)
             .await
-            .map_err(|error| ProviderError::Network(error.to_string()))?;
+            .map_err(|_| {
+                ProviderError::Protocol(
+                    "Telegram response body read failed or exceeded limit".into(),
+                )
+            })?;
+        let body = String::from_utf8_lossy(&body);
         match classify_channel_page(&body, &channel) {
             ChannelPageKind::Bot => {
                 return Err(ProviderError::InvalidSource(
@@ -96,7 +98,11 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
     let tag = selector("a[href^='?q=%23']")?;
 
     let mut results = Vec::new();
+    let mut recognized = 0;
+    let mut dated = 0;
+    let mut wraps = 0;
     for node in document.select(&wrap) {
+        wraps += 1;
         let Some(message_node) = node.select(&message).next() else {
             continue;
         };
@@ -106,14 +112,23 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
         let Some((_, id)) = post.rsplit_once('/') else {
             continue;
         };
+        if id.is_empty() {
+            continue;
+        }
+        recognized += 1;
         let text_node = message_node.select(&text).next();
         let content = text_node
-            .map(|node| node.text().collect::<Vec<_>>().join("\n"))
+            .map(text_with_breaks)
             .unwrap_or_default()
             .trim()
             .to_owned();
-        let buttons: Vec<_> = message_node.select(&keyboard_anchor).collect();
-        let mut links = extract_links(&content);
+        let buttons: Vec<_> = node.select(&keyboard_anchor).collect();
+        // Keep href positions in a separate password projection: visible labels
+        // alone cannot locate adjacent codes for multiple anchor-only links.
+        let password_context = text_node
+            .map(|node| project_text(node, true))
+            .unwrap_or_default();
+        let mut links = extract_links(&password_context);
         let body_anchors = text_node.into_iter().flat_map(|node| node.select(&anchor));
         for node in body_anchors.chain(buttons.iter().copied()) {
             let Some(href) = node.value().attr("href") else {
@@ -124,15 +139,18 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
                 continue;
             }
             let label = node.text().collect::<Vec<_>>().join(" ");
-            link.password =
-                extract_password(&label, href).or_else(|| extract_password(&content, href));
+            link.password = extract_password_for_link(&password_context, href, &label);
             let key = canonical_url_key(href);
             if let Some(existing) = links
                 .iter_mut()
                 .find(|known| canonical_url_key(&known.url) == key)
             {
-                if existing.password.is_none() {
+                if crate::core::extract_password("", href).is_some() || existing.password.is_none()
+                {
                     existing.password = link.password;
+                    if crate::core::extract_password("", href).is_some() {
+                        existing.url = link.url;
+                    }
                 }
             } else {
                 links.push(link);
@@ -153,9 +171,8 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
         };
         let title: String = content
             .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or(channel)
+            .find_map(message_title_line)
+            .unwrap_or_else(|| channel.to_owned())
             .chars()
             .take(160)
             .collect();
@@ -166,6 +183,9 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
             .and_then(|node| node.value().attr("datetime"))
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc));
+        if datetime.is_some() {
+            dated += 1;
+        }
         let mut images: Vec<String> = message_node
             .select(&image)
             .filter_map(|node| {
@@ -207,7 +227,51 @@ pub fn parse_telegram(html: &str, channel: &str) -> Result<Vec<SearchResult>, Pr
             images,
         });
     }
+    if wraps > 0 && recognized == 0 {
+        tracing::warn!(
+            channel,
+            "Telegram message structure changed: no recognizable posts"
+        );
+    } else if !results.is_empty() && dated == 0 {
+        tracing::warn!(
+            channel,
+            "Telegram message dates missing; retaining parsed links"
+        );
+    }
     Ok(results)
+}
+
+fn text_with_breaks(node: scraper::ElementRef<'_>) -> String {
+    project_text(node, false)
+}
+
+fn project_text(node: scraper::ElementRef<'_>, include_links: bool) -> String {
+    let mut text = String::new();
+    for child in node.children() {
+        match child.value() {
+            scraper::Node::Text(value) => text.push_str(value),
+            scraper::Node::Element(value) if value.name() == "br" => text.push('\n'),
+            scraper::Node::Element(_) => {
+                if let Some(element) = scraper::ElementRef::wrap(child) {
+                    if include_links
+                        && element.value().name() == "a"
+                        && let Some(href) = element.value().attr("href")
+                    {
+                        text.push_str(href);
+                        text.push(' ');
+                        let label = text_with_breaks(element);
+                        if !label.contains("http") {
+                            text.push_str(&label);
+                        }
+                    } else {
+                        text.push_str(&project_text(element, include_links));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    text
 }
 
 fn selector(value: &str) -> Result<Selector, ProviderError> {
@@ -221,6 +285,37 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path, query_param},
     };
+
+    #[test]
+    fn anchor_only_links_keep_their_adjacent_codes_and_explicit_url_wins() {
+        let html = r#"<div class="tgme_widget_message_wrap"><div class="tgme_widget_message" data-post="demo/1"><div class="tgme_widget_message_text">名称：作品<br><a href="https://pan.baidu.com/s/firstlink">百度</a> 提取码 a1b2<br><a href="https://drive.uc.cn/s/secondlink">UC</a> 提取码 c3d4<br><a href="https://alipan.com/s/thirdlink">阿里</a><br>https://pan.quark.cn/s/duplicate 提取码 guess1</div></div><div class="tgme_widget_message_inline_keyboard"><a href="https://pan.quark.cn/s/duplicate?pwd=real12">下载</a></div></div>"#;
+        let results = parse_telegram(html, "demo").unwrap();
+        let links = &results[0].links;
+        assert_eq!(links.len(), 4);
+        assert_eq!(links[0].password.as_deref(), Some("a1b2"));
+        assert_eq!(links[1].password.as_deref(), Some("c3d4"));
+        assert_eq!(links[2].password, None);
+        assert_eq!(links[3].password.as_deref(), Some("real12"));
+        assert!(links[3].url.contains("pwd=real12"));
+    }
+
+    #[test]
+    fn sibling_buttons_dom_dates_and_password_boundaries() {
+        let html = r#"<div class="tgme_widget_message_wrap"><div class="tgme_widget_message" data-post="demo/1"><div class="tgme_widget_message_text">📅 9月9日<br>#影视<br>名称：<b>兰香</b>如故 &amp; 番外<!-- ignored --><br>简介：目标关键词<br>https://pan.baidu.com/s/firstlink<br>提取码 1234<br>https://drive.uc.cn/s/abc123 提取码 uc99<br>https://alipan.com/s/nopassword</div><a class="tgme_widget_message_date"><time datetime="2026-09-09T00:00:00Z"></time></a></div><div class="tgme_widget_message_inline_keyboard"><a href="https://pan.quark.cn/s/button?pwd=a1b2">提取码 c3d4</a><a href="https://pan.baidu.com/s/firstlink">百度</a><a>callback</a></div></div><div class="tgme_widget_message_wrap"><div class="tgme_widget_message" data-post="demo/2"></div><div class="tgme_widget_message_inline_keyboard"><a href="https://pan.baidu.com/s/withoutcode">下载</a></div></div>"#;
+        let results = parse_telegram(html, "demo").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "兰香如故 & 番外");
+        assert!(results[0].datetime.is_some());
+        assert!(results[0].content.contains("兰香如故 & 番外\n简介"));
+        assert!(!results[0].content.contains("ignored"));
+        assert_eq!(results[0].links.len(), 4);
+        assert_eq!(results[0].links[0].password.as_deref(), Some("1234"));
+        assert_eq!(results[0].links[1].password.as_deref(), Some("uc99"));
+        assert_eq!(results[0].links[2].password, None);
+        assert_eq!(results[0].links[3].password.as_deref(), Some("a1b2"));
+        assert_eq!(results[1].links.len(), 1);
+        assert_eq!(results[1].links[0].password, None);
+    }
 
     #[test]
     fn parses_message_and_ignores_linkless_message() {

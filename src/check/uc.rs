@@ -1,5 +1,6 @@
 use super::engine::CheckEvaluation;
 use super::protocol::contains_any;
+use super::protocol::{BoundedRequest, BoundedResponse};
 use super::{CheckCloudType, CheckContext, CheckError, CheckItem, CheckState, LinkChecker};
 use async_trait::async_trait;
 pub struct UcChecker;
@@ -19,11 +20,11 @@ impl LinkChecker for UcChecker {
         _: &CheckItem,
         n: &str,
     ) -> Result<CheckEvaluation, CheckError> {
-        let r=ctx.client.get(n).header("user-agent","Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 Chrome/124.0 Safari/537.36").send().await?;
+        let r=ctx.client.get(n).header("user-agent","Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 Chrome/124.0 Safari/537.36").gated_send().await?;
         if r.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(CheckEvaluation::new(CheckState::Bad, "链接失效"));
         }
-        let t = r.text().await?;
+        let t = String::from_utf8_lossy(&r.bounded_bytes().await?).into_owned();
         Ok(
             if contains_any(&t, &["失效", "不存在", "违规", "删除", "已过期", "被取消"])
             {

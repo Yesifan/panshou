@@ -363,6 +363,8 @@ mod tests {
         }
     }
 
+    include!("streaming_cloud_tests.rs");
+
     struct FixtureProvider {
         delay: u64,
         password: Option<&'static str>,

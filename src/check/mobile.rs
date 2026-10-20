@@ -1,5 +1,6 @@
 use super::engine::CheckEvaluation;
 use super::mobile_crypto::{decrypt, encrypt};
+use super::protocol::{BoundedRequest, BoundedResponse};
 use super::protocol::{contains_any, json, string};
 use super::{CheckCloudType, CheckContext, CheckError, CheckItem, CheckState, LinkChecker};
 use async_trait::async_trait;
@@ -44,7 +45,7 @@ impl LinkChecker for MobileChecker {
         let id = share_id(n).ok_or_else(|| CheckError::Protocol("missing share id".into()))?;
         let raw=serde_json::to_vec(&serde_json::json!({"getOutLinkInfoReq":{"account":"","linkID":id,"passwd":item.password.as_deref().unwrap_or(""),"caSrt":1,"coSrt":1,"srtDr":0,"bNum":1,"pCaID":"root","eNum":200},"commonAccountInfo":{"account":"","accountType":1}})).map_err(|e|CheckError::Parse(e.to_string()))?;
         let encrypted = encrypt(&raw);
-        let body=ctx.client.post(&self.endpoint).header("hcy-cool-flag","1").header("x-deviceinfo","||3|12.27.0|chrome|131.0.0.0|5c7c68368f048245e1ce47f1c0f8f2d0||windows 10|1536X695|zh-CN|||").json(&encrypted).send().await?.bytes().await?;
+        let body=ctx.client.post(&self.endpoint).header("hcy-cool-flag","1").header("x-deviceinfo","||3|12.27.0|chrome|131.0.0.0|5c7c68368f048245e1ce47f1c0f8f2d0||windows 10|1536X695|zh-CN|||").json(&encrypted).gated_send().await?.bounded_bytes().await?;
         let decrypted = decrypt(&String::from_utf8_lossy(&body))
             .map_err(|e| CheckError::Parse(e.to_string()))?;
         let v = json(&decrypted)?;

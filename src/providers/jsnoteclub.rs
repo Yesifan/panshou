@@ -97,24 +97,23 @@ impl Provider for Jsnoteclub {
         if q.is_empty() {
             return Ok(vec![]);
         }
-        let home = ctx
-            .client
-            .get(self.endpoints.base.clone())
-            .header("user-agent", UA)
-            .header(
-                "accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            )
-            .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .header("referer", self.endpoints.base.as_str())
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let home = crate::providers::b_registry::http::text(
+            ctx.client
+                .get(self.endpoints.base.clone())
+                .header("user-agent", UA)
+                .header(
+                    "accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                )
+                .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("referer", self.endpoints.base.as_str()),
+            3,
+            200,
+            true,
+            std::time::Duration::from_secs(12),
+            16 << 20,
+        )
+        .await?;
         let key = parse_key(&home)?;
         let mut u = self
             .endpoints
@@ -126,21 +125,20 @@ impl Provider for Jsnoteclub {
             .append_pair("limit", "10000")
             .append_pair("fields", "id,slug,title,excerpt,url,updated_at,visibility")
             .append_pair("order", "updated_at DESC");
-        let body = ctx
-            .client
-            .get(u)
-            .header("user-agent", UA)
-            .header("accept", "application/json, text/plain, */*")
-            .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .header("referer", self.endpoints.base.as_str())
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let body = crate::providers::b_registry::http::text(
+            ctx.client
+                .get(u)
+                .header("user-agent", UA)
+                .header("accept", "application/json, text/plain, */*")
+                .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("referer", self.endpoints.base.as_str()),
+            3,
+            200,
+            true,
+            std::time::Duration::from_secs(12),
+            16 << 20,
+        )
+        .await?;
         let words = q.split_whitespace().collect::<Vec<_>>();
         let posts = parse_posts(&body)?
             .into_iter()
@@ -151,10 +149,13 @@ impl Provider for Jsnoteclub {
             .take(30)
             .collect::<Vec<_>>();
         let client = ctx.client.clone();
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let errors_ref = errors.clone();
         let rows = stream::iter(posts.into_iter().map(|p| {
             let client = client.clone();
+            let errors = errors_ref.clone();
             async move {
-                let body = client
+                let body = crate::providers::b_registry::http::text(client
                     .get(&p.url)
                     .header("user-agent", UA)
                     .header(
@@ -163,14 +164,9 @@ impl Provider for Jsnoteclub {
                     )
                     .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
                     .header("referer", &p.url)
-                    .send()
-                    .await
-                    .ok()?
-                    .error_for_status()
-                    .ok()?
-                    .text()
-                    .await
-                    .ok()?;
+                    , 3, 200, true, std::time::Duration::from_secs(10), 16 << 20).await.inspect_err(|e| {
+                        errors.lock().unwrap().push(e.to_string());
+                    }).ok()?;
                 let doc = Html::parse_document(&body);
                 let s = Selector::parse("section.gh-content, .gh-content, article").unwrap();
                 let fragment = doc
@@ -182,7 +178,7 @@ impl Provider for Jsnoteclub {
                 if links.is_empty() {
                     return None;
                 }
-                Some(SearchResult {
+                let result = SearchResult {
                     id: format!("jsnoteclub-{}", p.id),
                     source: Source::provider("jsnoteclub"),
                     datetime: DateTime::parse_from_rfc3339(&p.updated_at)
@@ -197,12 +193,21 @@ impl Provider for Jsnoteclub {
                         vec![p.slug]
                     },
                     images: vec![],
-                })
+                };
+                ctx.publish(vec![result.clone()]);
+                Some(result)
             }
         }))
         .buffered(8)
         .collect::<Vec<_>>()
         .await;
+        let failures = errors.lock().unwrap();
+        if let Some(error) = failures.first() {
+            return Err(ProviderError::Unavailable(format!(
+                "jsnoteclub {} detail requests failed: {error}",
+                failures.len()
+            )));
+        }
         Ok(rows.into_iter().flatten().collect())
     }
 }

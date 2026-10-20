@@ -62,13 +62,73 @@ pub async fn solve_inline_pow(
         return Err(ChallengeError::InvalidPow("id"));
     }
     let started = Instant::now();
-    let y = solve_pow(challenge)?;
+    let y = solve_pow_cooperative(challenge).await?;
     if let Some(wait) = minimum.checked_sub(started.elapsed()) {
         tokio::time::sleep(wait).await
     }
     Ok(Solution::Pow {
         id: Some(challenge.id.clone()),
         y,
+    })
+}
+
+pub(super) async fn solve_pow_cooperative(challenge: &Challenge) -> Result<String, ChallengeError> {
+    let modulus = BigUint::parse_bytes(challenge.modulus.as_bytes(), 16)
+        .filter(|v| v != &BigUint::from(0u8))
+        .ok_or(ChallengeError::InvalidPow("N"))?;
+    let mut value = BigUint::parse_bytes(challenge.initial.as_bytes(), 16)
+        .ok_or(ChallengeError::InvalidPow("x"))?;
+    if challenge.t == 0 {
+        return Err(ChallengeError::InvalidPow("t"));
+    }
+    for step in 0..challenge.t {
+        if step % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+        value = (&value * &value) % &modulus;
+    }
+    Ok(value.to_str_radix(16))
+}
+
+pub(super) async fn solve_legacy_cooperative(
+    challenge: &Challenge,
+) -> Result<Solution, ChallengeError> {
+    if challenge.id.is_empty()
+        || challenge.salt.is_empty()
+        || challenge.diff == 0
+        || challenge.challenge.is_empty()
+    {
+        return Err(ChallengeError::InvalidLegacy);
+    }
+    let targets = challenge
+        .challenge
+        .iter()
+        .map(|v| v.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut nonces = vec![None; targets.len()];
+    for nonce in 0..=challenge.diff {
+        if nonce % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{nonce}{}", challenge.salt).as_bytes())
+        );
+        for (index, target) in targets.iter().enumerate() {
+            if nonces[index].is_none() && hash == *target {
+                nonces[index] = Some(nonce);
+            }
+        }
+        if nonces.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    Ok(Solution::Legacy {
+        id: challenge.id.clone(),
+        nonces: nonces
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ChallengeError::Unsolved)?,
     })
 }
 
@@ -171,6 +231,25 @@ mod tests {
                 y: "4".into()
             }
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_zero_minimum_has_no_artificial_wait() {
+        let challenge: Challenge =
+            serde_json::from_str(r#"{"id":"fixture","N":"11","x":"2","t":1}"#).unwrap();
+        let start = tokio::time::Instant::now();
+        solve_inline_pow(&challenge, Duration::ZERO).await.unwrap();
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expensive_pow_is_cancellable() {
+        let challenge: Challenge =
+            serde_json::from_str(r#"{"id":"fixture","N":"11","x":"2","t":1000000000}"#).unwrap();
+        let task = tokio::spawn(async move { solve_inline_pow(&challenge, Duration::ZERO).await });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[test]

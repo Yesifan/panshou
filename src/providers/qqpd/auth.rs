@@ -18,7 +18,21 @@ pub struct QqQrChallenge {
 
 impl QqQrChallenge {
     pub fn write_png(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        std::fs::write(path, &self.image_png)
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&self.image_png)
     }
 }
 
@@ -62,26 +76,27 @@ impl QqpdAuth {
 
     pub async fn begin(&self) -> Result<QqQrChallenge, ProviderError> {
         let cache_buster = format!("0.{}", chrono::Utc::now().timestamp_millis());
-        let response = self
-            .client
-            .get(self.endpoints.qr_show.clone())
-            .query(&[
-                ("appid", "1600001587"),
-                ("e", "2"),
-                ("l", "M"),
-                ("s", "3"),
-                ("d", "72"),
-                ("v", "4"),
-                ("t", cache_buster.as_str()),
-                ("daid", "823"),
-                ("pt_3rd_aid", "0"),
-            ])
-            .header(header::USER_AGENT, USER_AGENT)
-            .send()
-            .await
-            .map_err(network)?
-            .error_for_status()
-            .map_err(network)?;
+        let response = crate::http::execute(
+            self.client
+                .get(self.endpoints.qr_show.clone())
+                .query(&[
+                    ("appid", "1600001587"),
+                    ("e", "2"),
+                    ("l", "M"),
+                    ("s", "3"),
+                    ("d", "72"),
+                    ("v", "4"),
+                    ("t", cache_buster.as_str()),
+                    ("daid", "823"),
+                    ("pt_3rd_aid", "0"),
+                ])
+                .header(header::USER_AGENT, USER_AGENT)
+                .timeout(std::time::Duration::from_secs(15)),
+        )
+        .await
+        .map_err(network)?
+        .error_for_status()
+        .map_err(network)?;
         let qrsig = response
             .headers()
             .get_all(header::SET_COOKIE)
@@ -89,7 +104,11 @@ impl QqpdAuth {
             .filter_map(|v| v.to_str().ok())
             .find_map(extract_qrsig)
             .ok_or_else(|| ProviderError::Protocol("QQ QR response omitted qrsig".into()))?;
-        let image_png = response.bytes().await.map_err(network)?.to_vec();
+        let image_png = crate::http::read_response(response, 4 * 1024 * 1024)
+            .await
+            .map_err(|_| {
+                ProviderError::Protocol("QQ QR image read failed or exceeded 4MiB".into())
+            })?;
         if image_png.is_empty() {
             return Err(ProviderError::Protocol(
                 "QQ returned an empty QR image".into(),
@@ -101,34 +120,35 @@ impl QqpdAuth {
     pub async fn poll(&self, qrsig: &str) -> Result<QqQrPoll, ProviderError> {
         let token = ptqrtoken(qrsig).to_string();
         let action = format!("0-0-{}", chrono::Utc::now().timestamp_millis());
-        let response = self
-            .client
-            .get(self.endpoints.qr_login.clone())
-            .query(&[
-                ("u1", self.endpoints.explore.as_str()),
-                ("ptqrtoken", token.as_str()),
-                ("ptredirect", "1"),
-                ("h", "1"),
-                ("t", "1"),
-                ("g", "1"),
-                ("from_ui", "1"),
-                ("ptlang", "2052"),
-                ("action", action.as_str()),
-                ("js_ver", "25100115"),
-                ("js_type", "1"),
-                ("pt_uistyle", "40"),
-                ("aid", "1600001587"),
-                ("daid", "823"),
-                ("o1vId", "11f3315cde61b7b5da200e4a09fe308c"),
-                ("pt_js_version", "28d22679"),
-            ])
-            .header(header::COOKIE, format!("qrsig={qrsig}"))
-            .header(header::USER_AGENT, USER_AGENT)
-            .send()
-            .await
-            .map_err(network)?
-            .error_for_status()
-            .map_err(network)?;
+        let response = crate::http::execute(
+            self.client
+                .get(self.endpoints.qr_login.clone())
+                .query(&[
+                    ("u1", self.endpoints.explore.as_str()),
+                    ("ptqrtoken", token.as_str()),
+                    ("ptredirect", "1"),
+                    ("h", "1"),
+                    ("t", "1"),
+                    ("g", "1"),
+                    ("from_ui", "1"),
+                    ("ptlang", "2052"),
+                    ("action", action.as_str()),
+                    ("js_ver", "25100115"),
+                    ("js_type", "1"),
+                    ("pt_uistyle", "40"),
+                    ("aid", "1600001587"),
+                    ("daid", "823"),
+                    ("o1vId", "11f3315cde61b7b5da200e4a09fe308c"),
+                    ("pt_js_version", "28d22679"),
+                ])
+                .header(header::COOKIE, format!("qrsig={qrsig}"))
+                .header(header::USER_AGENT, USER_AGENT)
+                .timeout(std::time::Duration::from_secs(15)),
+        )
+        .await
+        .map_err(network)?
+        .error_for_status()
+        .map_err(network)?;
         let set_cookies = response
             .headers()
             .get_all(header::SET_COOKIE)
@@ -136,7 +156,12 @@ impl QqpdAuth {
             .filter_map(|v| v.to_str().ok())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let body = response.text().await.map_err(network)?;
+        let body = crate::http::read_response(response, 4 * 1024 * 1024)
+            .await
+            .map_err(|_| {
+                ProviderError::Protocol("QQ QR response read failed or exceeded 4MiB".into())
+            })?;
+        let body = String::from_utf8_lossy(&body);
         if body.contains("二维码已失效") {
             return Ok(QqQrPoll {
                 status: QqQrStatus::Expired,
@@ -179,33 +204,37 @@ impl QqpdAuth {
             for cookie in initial {
                 session.add_cookie(cookie, &self.endpoints.qq_login_origin);
             }
-            session
-                .client()
-                .get(redirect.clone())
-                .header(header::USER_AGENT, USER_AGENT)
-                .send()
-                .await
-                .map_err(network)?
-                .error_for_status()
-                .map_err(network)?;
-            session
-                .client()
-                .get(self.endpoints.check_sig.clone())
-                .query(&[
-                    ("pttype", "1"),
-                    ("uin", uin),
-                    ("service", "ptqrlogin"),
-                    ("nodirect", "1"),
-                    ("ptsigx", ptsigx),
-                    ("s_url", self.endpoints.explore.as_str()),
-                    ("aid", "1600001587"),
-                    ("daid", "823"),
-                ])
-                .send()
-                .await
-                .map_err(network)?
-                .error_for_status()
-                .map_err(network)?;
+            crate::http::execute(
+                session
+                    .client()
+                    .get(redirect.clone())
+                    .header(header::USER_AGENT, USER_AGENT)
+                    .timeout(std::time::Duration::from_secs(15)),
+            )
+            .await
+            .map_err(network)?
+            .error_for_status()
+            .map_err(network)?;
+            crate::http::execute(
+                session
+                    .client()
+                    .get(self.endpoints.check_sig.clone())
+                    .query(&[
+                        ("pttype", "1"),
+                        ("uin", uin),
+                        ("service", "ptqrlogin"),
+                        ("nodirect", "1"),
+                        ("ptsigx", ptsigx),
+                        ("s_url", self.endpoints.explore.as_str()),
+                        ("aid", "1600001587"),
+                        ("daid", "823"),
+                    ])
+                    .timeout(std::time::Duration::from_secs(15)),
+            )
+            .await
+            .map_err(network)?
+            .error_for_status()
+            .map_err(network)?;
             let mut cookies = BTreeMap::new();
             for origin in [&self.endpoints.pd_origin, &self.endpoints.qq_login_origin] {
                 if let Some(value) = session.cookie_header(origin) {
@@ -226,25 +255,26 @@ impl QqpdAuth {
         for value in initial {
             collect_cookie(value, &mut cookies);
         }
-        let response = self
-            .client
-            .get(self.endpoints.check_sig.clone())
-            .query(&[
-                ("pttype", "1"),
-                ("uin", uin),
-                ("service", "ptqrlogin"),
-                ("nodirect", "1"),
-                ("ptsigx", ptsigx),
-                ("s_url", self.endpoints.explore.as_str()),
-                ("aid", "1600001587"),
-                ("daid", "823"),
-            ])
-            .header(header::COOKIE, cookie_header(&cookies))
-            .send()
-            .await
-            .map_err(network)?
-            .error_for_status()
-            .map_err(network)?;
+        let response = crate::http::execute(
+            self.client
+                .get(self.endpoints.check_sig.clone())
+                .query(&[
+                    ("pttype", "1"),
+                    ("uin", uin),
+                    ("service", "ptqrlogin"),
+                    ("nodirect", "1"),
+                    ("ptsigx", ptsigx),
+                    ("s_url", self.endpoints.explore.as_str()),
+                    ("aid", "1600001587"),
+                    ("daid", "823"),
+                ])
+                .header(header::COOKIE, cookie_header(&cookies))
+                .timeout(std::time::Duration::from_secs(15)),
+        )
+        .await
+        .map_err(network)?
+        .error_for_status()
+        .map_err(network)?;
         collect_response_cookies(&response, &mut cookies);
         cookies
             .entry("uin".into())
@@ -340,8 +370,12 @@ fn cookie_header(values: &BTreeMap<String, String>) -> String {
         .collect::<Vec<_>>()
         .join("; ")
 }
-fn network(error: reqwest::Error) -> ProviderError {
-    ProviderError::Network(error.to_string())
+fn network(error: impl Into<anyhow::Error>) -> ProviderError {
+    let error = error.into();
+    match error.downcast::<reqwest::Error>() {
+        Ok(error) => ProviderError::Network(error.without_url().to_string()),
+        Err(error) => ProviderError::Network(error.to_string()),
+    }
 }
 
 #[cfg(test)]

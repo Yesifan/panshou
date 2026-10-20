@@ -20,12 +20,14 @@ cargo test --all-features
 cargo build --release
 ```
 
-依赖第三方站点的 live tests 默认忽略，避免站点变化、Cloudflare、地域或限流导致 CI
-不稳定。显式运行示例：
+默认测试使用 fixtures 和 WireMock，不访问第三方站点，避免站点变化、Cloudflare、地域或
+限流导致 CI 不稳定。CI 另按发布目标构建 Linux x86_64/aarch64 musl、macOS x86_64/aarch64
+和 Windows x86_64；原生平台保留更新器和迁移运行测试。本地单平台构建不代表这些平台已验证。
+如需人工线上探测，可显式调用 CLI；结果应与离线测试结果分别记录：
 
 ```bash
-PANSOU_LIVE_TESTS=1 \
-  cargo test provider_pansearch_live -- --ignored
+cargo run -- search "关键词" --source provider --provider pansearch \
+  --no-check --timeout 10 --all-timeout 15
 ```
 
 实现模块、数据流、并发模型与安全边界参见[整体架构](architecture.md)。完整的 v1 设计

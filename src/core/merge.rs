@@ -74,10 +74,13 @@ pub fn merge_links(
             {
                 continue;
             }
-            let candidate = MergedLink {
+            let mut candidate = MergedLink {
                 cloud_type: link.cloud_type,
                 url: link.url.clone(),
-                password: link.password.clone(),
+                password: link
+                    .password
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
                 note: trim_description(note),
                 datetime: link.datetime.or(result.datetime),
                 source: result.source.clone(),
@@ -88,6 +91,11 @@ pub fn merge_links(
             if let Some(&position) = positions.get(&key) {
                 let existing = &merged[position];
                 if candidate.datetime > existing.datetime {
+                    // Newer metadata must not erase a code already discovered
+                    // by another source or an earlier incremental snapshot.
+                    if candidate.password.is_none() {
+                        candidate.password = existing.password.clone();
+                    }
                     merged[position] = candidate;
                 } else if existing.password.is_none() && candidate.password.is_some() {
                     merged[position].password = candidate.password;

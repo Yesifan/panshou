@@ -1,4 +1,5 @@
 use super::engine::CheckEvaluation;
+use super::protocol::{BoundedRequest, BoundedResponse};
 use super::protocol::{contains_any, json, number, string};
 use super::{CheckCloudType, CheckContext, CheckError, CheckItem, CheckState, LinkChecker};
 use async_trait::async_trait;
@@ -63,14 +64,14 @@ impl LinkChecker for XunleiChecker {
         if !token.is_empty() {
             req = req.header("x-captcha-token", token);
         }
-        let r = req.send().await?;
+        let r = req.gated_send().await?;
         if matches!(
             r.status(),
             reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN
         ) {
             return Ok(CheckEvaluation::new(CheckState::Bad, "链接失效"));
         }
-        let v = json(&r.bytes().await?)?;
+        let v = json(&r.bounded_bytes().await?)?;
         let status = string(&v, &["share_status"]);
         let err = format!(
             "{} {} {}",
@@ -111,7 +112,7 @@ impl XunleiChecker {
         let version = "1.10.0.2633";
         let package = "com.xunlei.browser";
         let (timestamp, sign) = signature(client, version, package, device);
-        let v=json(&ctx.client.post(&self.captcha).header("x-device-id",device).header("x-client-id",client).header("x-client-version",version).json(&serde_json::json!({"action":"get:/drive/v1/share","captcha_token":"","client_id":client,"device_id":device,"meta":{"timestamp":timestamp,"captcha_sign":sign,"client_version":version,"package_name":package},"redirect_uri":"xlaccsdk01://xunlei.com/callback?state=harbor"})).send().await?.bytes().await?)?;
+        let v=json(&ctx.client.post(&self.captcha).header("x-device-id",device).header("x-client-id",client).header("x-client-version",version).json(&serde_json::json!({"action":"get:/drive/v1/share","captcha_token":"","client_id":client,"device_id":device,"meta":{"timestamp":timestamp,"captcha_sign":sign,"client_version":version,"package_name":package},"redirect_uri":"xlaccsdk01://xunlei.com/callback?state=harbor"})).gated_send().await?.bounded_bytes().await?)?;
         if !string(&v, &["url"]).is_empty() {
             return Err(CheckError::Protocol("xunlei captcha required".into()));
         }

@@ -1,3 +1,49 @@
+trait ExecuteRequest {
+    async fn execute(self) -> anyhow::Result<reqwest::Response>;
+}
+impl ExecuteRequest for reqwest::RequestBuilder {
+    async fn execute(self) -> anyhow::Result<reqwest::Response> {
+        crate::http::execute(self).await
+    }
+}
+
+trait RetrySend {
+    async fn send_retry(self) -> anyhow::Result<reqwest::Response>;
+}
+impl RetrySend for reqwest::RequestBuilder {
+    async fn send_retry(self) -> anyhow::Result<reqwest::Response> {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200 << (attempt - 1))).await;
+            }
+            let request = self
+                .try_clone()
+                .expect("provider request body is replayable");
+            let result = request.execute().await.and_then(|r| {
+                if r.status().as_u16() == 200 {
+                    Ok(r)
+                } else {
+                    Err(anyhow::anyhow!("HTTP {}", r.status()))
+                }
+            });
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt == 2 => return Err(error),
+                Err(_) => {}
+            }
+        }
+        unreachable!("three attempts return a response or error")
+    }
+}
+
+async fn read_text(response: reqwest::Response) -> anyhow::Result<String> {
+    let status = response.status();
+    let body = crate::http::read_response(response, 16 * 1024 * 1024)
+        .await
+        .map_err(|e| anyhow::anyhow!("cldi response body HTTP {status}: {e}"))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 use crate::core::{Link, ProviderError, SearchResult, Source};
 use crate::providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext};
 use async_trait::async_trait;
@@ -32,9 +78,16 @@ fn parse_page(body: &str) -> Result<Vec<SearchResult>, ProviderError> {
         Selector::parse("article.resource").map_err(|e| ProviderError::Parse(e.to_string()))?;
     let anchor = Selector::parse("h2 a[href]").expect("selector");
     let meta = Selector::parse(".meta").expect("selector");
-    let hash = Regex::new(r"(?i)/hash/([a-f0-9]{40})\.html").expect("regex");
-    let date = Regex::new(r"添加时间[:：]\s*(\d{4}-\d{2}-\d{2})").expect("regex");
-    let ads = Regex::new(r"【[^】]*】").expect("regex");
+    static HASH_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)/hash/([a-f0-9]{40})\.html").expect("regex"));
+    let hash = &*HASH_RE;
+    static DATE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"添加时间[:：]\s*(\d{4}-\d{2}-\d{2})").expect("regex")
+    });
+    let date = &*DATE_RE;
+    static ADS_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"【[^】]*】").expect("regex"));
+    let ads = &*ADS_RE;
     let mut out = Vec::new();
     for article in doc.select(&card) {
         let Some(a) = article.select(&anchor).next() else {
@@ -146,29 +199,27 @@ impl Provider for CldiProvider {
                     .header(reqwest::header::CACHE_CONTROL, "no-cache")
                     .header(reqwest::header::PRAGMA, "no-cache")
                     .header(reqwest::header::REFERER, self.endpoints.base.as_str())
-                    .send()
+                    .send_retry()
                     .await
                     .map_err(|error| ProviderError::Network(error.to_string()))?;
                 if !r.status().is_success() {
                     return Err(ProviderError::Protocol(format!("HTTP {}", r.status())));
                 }
-                let body = r
-                    .text()
-                    .await
+                let body = read_text(r).await
                     .map_err(|error| ProviderError::Network(error.to_string()))?;
-                parse_page(&body)
+                let rows = parse_page(&body)?;
+                ctx.publish(rows.clone());
+                Ok(rows)
             }
         });
         let pages = tokio::time::timeout(ctx.timeout, join_all(jobs))
             .await
             .map_err(|_| ProviderError::Timeout)?;
         let mut out = Vec::new();
-        let mut successes = 0usize;
         let mut first_error = None;
         for page in pages {
             match page {
                 Ok(page) => {
-                    successes += 1;
                     out.extend(page);
                 }
                 Err(error) => {
@@ -176,10 +227,8 @@ impl Provider for CldiProvider {
                 }
             };
         }
-        if successes == 0 {
-            return Err(first_error.unwrap_or_else(|| {
-                ProviderError::Unavailable("all cldi search pages failed".into())
-            }));
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(out)
     }

@@ -1,8 +1,27 @@
+trait ExecuteRequest {
+    async fn execute(self) -> anyhow::Result<reqwest::Response>;
+}
+impl ExecuteRequest for reqwest::RequestBuilder {
+    async fn execute(self) -> anyhow::Result<reqwest::Response> {
+        crate::http::execute(self).await
+    }
+}
+
+async fn read_text(response: reqwest::Response) -> anyhow::Result<String> {
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(anyhow::anyhow!("clmao HTTP {status}"));
+    }
+    let body = crate::http::read_response(response, 16 * 1024 * 1024)
+        .await
+        .map_err(|error| error.context(format!("clmao response body HTTP {status}")))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 use crate::core::{Link, ProviderError, SearchResult, Source};
 use crate::providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext};
 use async_trait::async_trait;
 use base64::Engine;
-use futures::{StreamExt, stream};
 use regex::Regex;
 use scraper::{Html, Selector};
 use url::Url;
@@ -43,7 +62,10 @@ impl Clmao {
     }
 }
 fn decode_payload(raw: &str) -> String {
-    let re = Regex::new(r#"(?s)atob\(["']([A-Za-z0-9+/=]+)["']\)"#).unwrap();
+    static RE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r#"(?s)atob\(["']([A-Za-z0-9+/=]+)["']\)"#).unwrap()
+    });
+    let re = &*RE_RE;
     let Some(v) = re.captures(raw).and_then(|c| c.get(1)) else {
         return raw.into();
     };
@@ -100,7 +122,9 @@ fn detail(body: &str) -> Option<(String, String, Link)> {
     let decoded = decode_payload(body);
     let d = Html::parse_document(&decoded);
     let a = Selector::parse("a[href^='magnet:']").unwrap();
-    let re = Regex::new(r#"(?i)magnet:\?[^\s"'<>]+"#).unwrap();
+    static RE_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r#"(?i)magnet:\?[^\s"'<>]+"#).unwrap());
+    let re = &*RE_RE;
     let magnet = d
         .select(&a)
         .next()
@@ -178,35 +202,39 @@ impl Provider for Clmao {
         u.query_pairs_mut()
             .append_pair("word", &word)
             .append_pair("sort", "time");
-        let body = browser_headers(ctx.client.get(u))
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let body = read_text(
+            browser_headers(ctx.client.get(u))
+                .execute()
+                .await
+                .map_err(|e| ProviderError::Network(e.to_string()))?
+                .error_for_status()
+                .map_err(|e| ProviderError::Network(e.to_string()))?,
+        )
+        .await
+        .map_err(|e| ProviderError::Network(e.to_string()))?;
         let decoded = decode_payload(&body);
         let hits = modern_hits(&decoded, &self.endpoints.base);
         if hits.is_empty() {
             return Ok(legacy(&decoded));
         }
         let client = ctx.client.clone();
-        let rows = stream::iter(hits.into_iter().map(|h| {
+        let jobs = hits.into_iter().map(|h| {
             let client = client.clone();
             async move {
-                let b = browser_headers(client.get(h.url))
-                    .send()
-                    .await
-                    .ok()?
-                    .error_for_status()
-                    .ok()?
-                    .text()
-                    .await
-                    .ok()?;
-                let (t, c, l) = detail(&b)?;
-                Some(SearchResult {
+                let b = read_text(
+                    browser_headers(client.get(h.url))
+                        .execute()
+                        .await
+                        .map_err(super::c_support::network)?
+                        .error_for_status()
+                        .map_err(super::c_support::network)?,
+                )
+                .await
+                .map_err(super::c_support::network)?;
+                let Some((t, c, l)) = detail(&b) else {
+                    return Ok(None);
+                };
+                Ok::<_, ProviderError>(Some(SearchResult {
                     id: format!("clmao-{}", h.id),
                     source: Source::provider("clmao"),
                     datetime: None,
@@ -215,18 +243,55 @@ impl Provider for Clmao {
                     links: vec![l],
                     tags: vec![],
                     images: vec![],
-                })
+                }))
             }
-        }))
-        .buffered(10)
-        .collect::<Vec<_>>()
-        .await;
-        Ok(rows.into_iter().flatten().collect())
+        });
+        super::collect_partial(ctx, jobs, 10).await
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn detail_status_is_preserved_and_completed_rows_survive() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        let fixture = include_str!("../../tests/fixtures/providers/clmao/success-search.html");
+        Mock::given(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{fixture}{}",
+                fixture.replace("movie-42", "movie-43")
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(path("/detail/movie-42"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(include_str!(
+                "../../tests/fixtures/providers/clmao/success.html"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(path("/detail/movie-43"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base: Url = server.uri().parse().unwrap();
+        let provider = Clmao::new(Endpoints { base });
+        let options = crate::http::ClientOptions {
+            redirect: crate::http::RedirectPolicy::None,
+            ..Default::default()
+        };
+        let client = crate::http::HttpClientFactory::new()
+            .client(&options)
+            .unwrap();
+        let ctx = SearchContext::new(client, std::time::Duration::from_secs(5));
+        let error = provider.search(&ctx, "仙逆").await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error}");
+        let rows = ctx.finish(Vec::new());
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].links.is_empty());
+    }
+
     #[test]
     fn fixture_success() {
         let hits = modern_hits(

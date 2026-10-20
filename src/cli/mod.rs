@@ -12,6 +12,7 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod channel;
+mod panlian_login;
 mod streaming;
 mod upgrade;
 
@@ -23,10 +24,15 @@ use crate::{
     output::{OutputFormat, stdout, write_checks},
     providers::{
         Provider, SearchContext, builtin_stateless_providers,
+        builtin_stateless_providers_with_options,
         gying::{Endpoints as GyingEndpoints, GyingProfile, GyingProvider},
-        panlian::{Endpoints as PanlianEndpoints, PanlianProfile, PanlianProvider},
+        panlian::{
+            Endpoints as PanlianEndpoints, LoginOutcome as PanlianLoginOutcome, PanlianProfile,
+            PanlianProvider,
+        },
         qqpd::{QqQrStatus, QqpdProfile, QqpdProvider},
         weibo::{QrStatus, WeiboProfile, WeiboProvider},
+        woniu::{Endpoints as WoniuEndpoints, WoniuProfile, WoniuProvider},
     },
     search::{SearchEngine, SearchOptions},
     state::StateStore,
@@ -45,7 +51,7 @@ const SEARCH_GUIDANCE: &str = "Resource names may be inconsistent across sources
 const QQPD_LOGIN_GUIDANCE: &str = "Scan the QR code with the QQ mobile app and confirm on your phone. After login, configure at least one QQ channel with:\n  pansou provider configure qqpd add --profile <PROFILE> --channel <CHANNEL_ID_OR_PD_URL>\nOpen the channel in your browser and copy its https://pd.qq.com/g/<CHANNEL_ID> URL; either the channel ID or the full URL is accepted.";
 const QQPD_CHANNEL_GUIDANCE: &str = "Open the QQ channel in your browser and copy its URL. For example, https://pd.qq.com/g/example contains channel ID example. Either the channel ID or the full URL can be passed to --channel.";
 const GYING_LOGIN_GUIDANCE: &str = "Gying is ready to search immediately after login. It uses the configured provider base URL; change it only when the service moves or you use a mirror:\n  pansou provider configure gying --base-url <URL>\nPasswords are prompted securely by default. --remember-credentials requires PANSOU_STATE_KEY and allows one automatic login retry when the saved cookie expires.";
-const PANLIAN_LOGIN_GUIDANCE: &str = "Panlian is ready to search immediately after login. Cloud-drive filtering is optional and global across profiles:\n  pansou provider configure panlian --blocked-cloud <CLOUD>\nPasswords are prompted securely by default. --remember-credentials requires PANSOU_STATE_KEY and allows one automatic login retry when the saved cookie expires.";
+const PANLIAN_LOGIN_GUIDANCE: &str = "Panlian requires a graphic captcha and may ask you to confirm the account's bound email (not a mail OTP). The captcha image is stored in a private temporary file and removed after login. Non-TTY input requires --interactive; with --password-stdin, provide the password on the first line, then the captcha and bound email when prompted. Expired sessions require manual login; passwords are never saved. Optional global cloud filtering:\n  pansou provider configure panlian --blocked-cloud <CLOUD>";
 const WEIBO_LOGIN_GUIDANCE: &str = "Scan the QR code with the Weibo mobile app and confirm on your phone. After login, add at least one target user with:\n  pansou provider configure weibo add --profile <PROFILE> --user <UID_OR_PROFILE_URL>\nPansou returns keyword-matched posts only when a supported cloud-drive, magnet, or ed2k link is found in the post, a linked page, or the first comment fallback.";
 const WEIBO_USER_GUIDANCE: &str = "Open the target user's Weibo profile and copy its URL. For example, https://weibo.com/u/1234567890 contains UID 1234567890. Either the numeric UID or the full profile URL can be passed to --user.";
 
@@ -135,7 +141,7 @@ pub struct SearchArgs {
     /// Override saved Telegram channels for this search; repeat as needed.
     #[arg(long = "channel")]
     pub channels: Vec<String>,
-    /// Keep only this cloud-drive type; repeat as needed.
+    /// Keep only this cloud-drive type (including weiyun/lanzou); repeat as needed.
     #[arg(long = "cloud")]
     pub clouds: Vec<CloudType>,
     /// Require an additional keyword in results; repeat as needed.
@@ -264,6 +270,8 @@ pub enum LoginProviderCommand {
     Gying(GyingLoginArgs),
     /// Username/password login.
     Panlian(PanlianLoginArgs),
+    /// Username/password login to Woniu; no password is retained.
+    Woniu(WoniuLoginArgs),
 }
 
 #[derive(Debug, Args)]
@@ -309,6 +317,9 @@ pub struct GyingLoginArgs {
 #[derive(Debug, Args)]
 #[command(after_long_help = PANLIAN_LOGIN_GUIDANCE)]
 pub struct PanlianLoginArgs {
+    /// Explicitly allow the manual challenge dialogue with non-TTY stdin.
+    #[arg(long)]
+    pub interactive: bool,
     /// Profile name for the saved session.
     #[arg(long, default_value = "main")]
     pub profile: String,
@@ -318,9 +329,20 @@ pub struct PanlianLoginArgs {
     /// Read the account password from standard input instead of prompting.
     #[arg(long)]
     pub password_stdin: bool,
-    /// Save encrypted credentials for one automatic login retry after cookie expiry.
-    #[arg(long)]
+    /// Deprecated: Panlian no longer saves passwords; this option is rejected.
+    #[arg(long, hide = true)]
     pub remember_credentials: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WoniuLoginArgs {
+    #[arg(long, default_value = "main")]
+    pub profile: String,
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Read the password from stdin instead of prompting.
+    #[arg(long)]
+    pub password_stdin: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -329,10 +351,17 @@ pub enum LoginProviderName {
     Weibo,
     Gying,
     Panlian,
+    Woniu,
 }
 
 impl LoginProviderName {
-    const ALL: [Self; 4] = [Self::Qqpd, Self::Weibo, Self::Gying, Self::Panlian];
+    const ALL: [Self; 5] = [
+        Self::Qqpd,
+        Self::Weibo,
+        Self::Gying,
+        Self::Panlian,
+        Self::Woniu,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -340,13 +369,14 @@ impl LoginProviderName {
             Self::Weibo => "weibo",
             Self::Gying => "gying",
             Self::Panlian => "panlian",
+            Self::Woniu => "woniu",
         }
     }
 
     const fn auth_label(self) -> &'static str {
         match self {
             Self::Qqpd | Self::Weibo => "qr",
-            Self::Gying | Self::Panlian => "password",
+            Self::Gying | Self::Panlian | Self::Woniu => "password",
         }
     }
 }
@@ -367,6 +397,8 @@ pub enum ConfigureProviderCommand {
     Gying(GyingConfigureArgs),
     /// Configure Panlian cloud-drive filtering.
     Panlian(PanlianConfigureArgs),
+    /// Change Woniu's base URL; a real change expires saved sessions.
+    Woniu(GyingConfigureArgs),
 }
 
 #[derive(Debug, Args)]
@@ -517,7 +549,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Provider(args) => run_provider(args, &paths, &mut config).await,
         Command::Config(args) => {
             match args.command {
-                ConfigCommand::Show => println!("{}", toml::to_string_pretty(&config)?),
+                ConfigCommand::Show => {
+                    let mut visible = config.clone();
+                    visible.network.proxy = visible
+                        .network
+                        .proxy
+                        .as_deref()
+                        .map(crate::config::redacted_proxy);
+                    println!("{}", toml::to_string_pretty(&visible)?);
+                }
                 ConfigCommand::Path => println!("{}", paths.config_file.display()),
             }
             Ok(EXIT_OK)
@@ -558,7 +598,13 @@ pub fn help_defaults() -> String {
             })
             .count();
         for name in LoginProviderName::ALL.map(LoginProviderName::as_str) {
-            if stateful_ready(&store, name)? {
+            if config
+                .search
+                .providers
+                .iter()
+                .any(|selected| selected == name)
+                && stateful_ready(&store, name)?
+            {
                 providers += 1;
             }
         }
@@ -648,13 +694,14 @@ fn configured_stateful(
     options: &ClientOptions,
 ) -> anyhow::Result<Vec<Arc<dyn Provider>>> {
     let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
-    if stateful_ready(store, "qqpd")? {
+    let selected = |name| config.search.providers.iter().any(|value| value == name);
+    if selected("qqpd") && stateful_ready(store, "qqpd")? {
         providers.push(Arc::new(QqpdProvider::new(store.clone())));
     }
-    if stateful_ready(store, "weibo")? {
+    if selected("weibo") && stateful_ready(store, "weibo")? {
         providers.push(Arc::new(WeiboProvider::new(store.clone())));
     }
-    if stateful_ready(store, "gying")? {
+    if selected("gying") && stateful_ready(store, "gying")? {
         let endpoints = GyingEndpoints::parse(&config.providers.gying.base_url)?;
         providers.push(Arc::new(GyingProvider::load(
             store.clone(),
@@ -663,7 +710,7 @@ fn configured_stateful(
             options.clone(),
         )?));
     }
-    if stateful_ready(store, "panlian")? {
+    if selected("panlian") && stateful_ready(store, "panlian")? {
         let blocked = config
             .providers
             .panlian
@@ -676,6 +723,17 @@ fn configured_stateful(
             PanlianEndpoints::default(),
             blocked,
         )?));
+    }
+    if selected("woniu") && stateful_ready(store, "woniu")? {
+        let provider = WoniuProvider::load(
+            store.clone(),
+            WoniuEndpoints::parse(&config.providers.woniu.base_url)?,
+            HttpClientFactory::new(),
+            options.clone(),
+        )?;
+        if !provider.profile_names()?.is_empty() {
+            providers.push(Arc::new(provider));
+        }
     }
     Ok(providers)
 }
@@ -699,6 +757,9 @@ fn stateful_ready(store: &StateStore, name: &str) -> anyhow::Result<bool> {
             "panlian" => store
                 .load::<PanlianProfile>(name, &profile)?
                 .is_some_and(|state| state.status == "active" && !state.cookie.trim().is_empty()),
+            "woniu" => store
+                .load::<WoniuProfile>(name, &profile)?
+                .is_some_and(|state| state.is_ready(chrono::Utc::now())),
             _ => false,
         };
         if ready {
@@ -724,25 +785,13 @@ async fn run_search(args: SearchArgs, paths: &AppPaths, mut config: Config) -> a
         Vec::new()
     } else {
         let store = StateStore::from_paths(paths)?;
-        let mut available = builtin_stateless_providers();
+        let mut available = builtin_stateless_providers_with_options(&client_options);
         available.extend(configured_stateful(&store, &config, &client_options)?);
-        let explicit = !args.providers.is_empty();
-        let selected_names: HashSet<_> = if !explicit {
-            let mut names = config
-                .search
-                .providers
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>();
-            for name in LoginProviderName::ALL.map(LoginProviderName::as_str) {
-                if !store.list_profiles(name)?.is_empty() {
-                    names.insert(name);
-                }
-            }
-            names
-        } else {
-            args.providers.iter().map(String::as_str).collect()
-        };
+        let explicit = config.search.providers_explicit;
+        // Configuration (including an explicit empty list) is authoritative.
+        // Logging in makes a selected source ready; it does not select it.
+        let selected_names: HashSet<_> =
+            config.search.providers.iter().map(String::as_str).collect();
         let known = available
             .iter()
             .map(|provider| provider.meta().name)
@@ -927,7 +976,18 @@ async fn run_provider(
         }
         ProviderCommand::Logout { name, profile } => {
             require_stateful_name(&name)?;
-            store.delete(&name, &profile)?;
+            if name == "woniu" {
+                let (_, _, _, options) = client(config, None, None)?;
+                let provider = WoniuProvider::load(
+                    store.clone(),
+                    WoniuEndpoints::parse(&config.providers.woniu.base_url)?,
+                    HttpClientFactory::new(),
+                    options,
+                )?;
+                provider.logout(&profile).await?;
+            } else {
+                store.delete(&name, &profile)?;
+            }
         }
         ProviderCommand::Status { name, profile } => {
             require_stateful_name(&name)?;
@@ -936,6 +996,16 @@ async fn run_provider(
                 None => store.list_profiles(&name)?,
             };
             for profile in profiles {
+                if name == "woniu" && store.load::<WoniuProfile>(&name, &profile)?.is_some() {
+                    let (_, _, _, options) = client(config, None, None)?;
+                    let provider = WoniuProvider::load(
+                        store.clone(),
+                        WoniuEndpoints::parse(&config.providers.woniu.base_url)?,
+                        HttpClientFactory::new(),
+                        options,
+                    )?;
+                    provider.verify(&profile).await?;
+                }
                 let status = profile_status(&store, &name, &profile)?;
                 println!("{name}/{profile}: {status}");
             }
@@ -943,6 +1013,22 @@ async fn run_provider(
         ProviderCommand::Login(args) => {
             let (_, _, _, options) = client(config, None, None)?;
             match args.provider {
+                LoginProviderCommand::Woniu(args) => {
+                    let _ = store.profile_path("woniu", &args.profile)?;
+                    let username = required_username(args.username.as_deref())?;
+                    let password = read_password(args.password_stdin)?;
+                    let provider = WoniuProvider::load(
+                        store.clone(),
+                        WoniuEndpoints::parse(&config.providers.woniu.base_url)?,
+                        HttpClientFactory::new(),
+                        options,
+                    )?;
+                    tokio::select! {
+                        result = provider.login(&args.profile, username, &password) => { result?; }
+                        signal = tokio::signal::ctrl_c() => { signal?; return Ok(130); }
+                    }
+                    println!("woniu/{}: logged in and ready", args.profile);
+                }
                 LoginProviderCommand::Qqpd(args) => {
                     let _ = store.profile_path("qqpd", &args.profile)?;
                     let factory = HttpClientFactory::new();
@@ -1096,48 +1182,7 @@ async fn run_provider(
                     );
                 }
                 LoginProviderCommand::Panlian(args) => {
-                    let _ = store.profile_path("panlian", &args.profile)?;
-                    if args.remember_credentials && !store.encryption_enabled() {
-                        return Err(usage("--remember-credentials requires PANSOU_STATE_KEY"));
-                    }
-                    let username = required_username(args.username.as_deref())?;
-                    let password = read_password(args.password_stdin)?;
-                    let factory = HttpClientFactory::new();
-                    let session = factory.session(&options)?;
-                    let blocked = config
-                        .providers
-                        .panlian
-                        .blocked_clouds
-                        .iter()
-                        .map(|v| CloudType::from_str(v))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let provider =
-                        PanlianProvider::load(store.clone(), PanlianEndpoints::default(), blocked)?;
-                    let login = provider
-                        .login(
-                            &session,
-                            &args.profile,
-                            username,
-                            &password,
-                            args.remember_credentials,
-                        )
-                        .await;
-                    match login {
-                        Ok(_) => {}
-                        Err(error @ crate::core::ProviderError::AuthRequired) => {
-                            eprintln!("Panlian login failed; check the username and password");
-                            return Err(error.into());
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                    println!("panlian/{}: logged in and ready", args.profile);
-                    println!(
-                        "Verify with: pansou provider status panlian --profile {}",
-                        args.profile
-                    );
-                    println!(
-                        "Optional global filter: pansou provider configure panlian --blocked-cloud <CLOUD>"
-                    );
+                    return panlian_login::run(args, store, config, options).await;
                 }
             }
         }
@@ -1208,6 +1253,9 @@ async fn run_provider(
                         }
                     }
                 }
+                for warning in provider.take_diagnostics() {
+                    eprintln!("{warning}");
+                }
             }
             ConfigureProviderCommand::Weibo(args) => {
                 let provider = WeiboProvider::new(store.clone());
@@ -1260,6 +1308,23 @@ async fn run_provider(
                         }
                     }
                 }
+            }
+            ConfigureProviderCommand::Woniu(args) => {
+                let endpoints = WoniuEndpoints::parse(&args.base_url)?;
+                let previous = WoniuEndpoints::parse(&config.providers.woniu.base_url)?;
+                if endpoints.base != previous.base {
+                    let (_, _, _, options) = client(config, None, None)?;
+                    let provider = WoniuProvider::load(
+                        store.clone(),
+                        previous,
+                        HttpClientFactory::new(),
+                        options,
+                    )?;
+                    provider.expire_all()?;
+                }
+                config.providers.woniu.base_url =
+                    endpoints.base.as_str().trim_end_matches('/').to_owned();
+                save_config(paths, config)?;
             }
             ConfigureProviderCommand::Gying(args) => {
                 GyingEndpoints::parse(&args.base_url)?;
@@ -1331,6 +1396,10 @@ fn profile_status(
             .load::<PanlianProfile>(provider, profile)?
             .filter(|value| value.status == "active" && !value.cookie.trim().is_empty())
             .map_or("login required", |_| "ready"),
+        "woniu" => store
+            .load::<WoniuProfile>(provider, profile)?
+            .filter(|value| value.is_ready(now))
+            .map_or("login required", |_| "ready"),
         "qqpd" => match store.load::<QqpdProfile>(provider, profile)? {
             Some(value) if !value.is_ready(now) => "login required",
             Some(value) if value.channels.is_empty() => "configuration required",
@@ -1345,6 +1414,18 @@ fn profile_status(
 fn save_config(paths: &AppPaths, config: &Config) -> anyhow::Result<()> {
     paths.ensure_dirs()?;
     let mut saved = toml::Value::try_from(config)?;
+    let search = saved
+        .get_mut("search")
+        .and_then(toml::Value::as_table_mut)
+        .expect("serialized config contains search table");
+    if let Some(selection) = &config.search.saved_providers {
+        search.insert(
+            "providers".into(),
+            toml::Value::Array(selection.iter().cloned().map(toml::Value::String).collect()),
+        );
+    } else {
+        search.remove("providers");
+    }
     // Provider configuration must not silently delete the deprecated field.
     if paths.config_file.exists() {
         let original: toml::Value = toml::from_str(&std::fs::read_to_string(&paths.config_file)?)?;
@@ -1445,6 +1526,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_cloud_filters_parse_without_adding_checkers() {
+        for cloud in ["weiyun", "lanzou"] {
+            let cli =
+                Cli::try_parse_from(["pansou", "search", "movie", "--cloud", cloud, "--no-check"])
+                    .unwrap();
+            let Command::Search(args) = cli.command else {
+                panic!("search expected")
+            };
+            assert_eq!(args.clouds[0].to_string(), cloud);
+            assert!(args.no_check);
+        }
+    }
+
+    #[test]
     fn qr_fallback_uses_unique_temporary_png() {
         let first = write_qr_png("qqpd", b"png-one").unwrap();
         let second = write_qr_png("qqpd", b"png-two").unwrap();
@@ -1475,6 +1570,115 @@ mod tests {
         assert!(rendered.starts_with("\x1b[30;47m"));
         assert!(rendered.contains(['█', '▀', '▄']));
         assert!(rendered.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn changed_woniu_site_expires_profiles_before_default_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_dirs(
+            root.path().join("config"),
+            root.path().join("state"),
+            root.path().join("cache"),
+        );
+        let store = StateStore::from_paths(&paths).unwrap();
+        let now = chrono::Utc::now();
+        let profile = WoniuProfile {
+            username: "fixture".into(),
+            cookie: "sid=fixture".into(),
+            base_url: "https://old.example".into(),
+            status: "active".into(),
+            expires_at: now + chrono::Duration::days(1),
+            last_access_at: now,
+            last_check_at: now,
+        };
+        store.save("woniu", "main", &profile).unwrap();
+        let mut config = Config::default();
+        config.providers.woniu.base_url = "https://new.example".into();
+        assert!(
+            configured_stateful(&store, &config, &ClientOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+        let saved = store
+            .load::<WoniuProfile>("woniu", "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, "expired");
+        assert!(saved.cookie.is_empty());
+    }
+
+    #[test]
+    fn unselected_authenticated_sources_cannot_block_an_explicit_search() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_dirs(
+            root.path().join("config"),
+            root.path().join("state"),
+            root.path().join("cache"),
+        );
+        let store = StateStore::from_paths(&paths).unwrap();
+        store
+            .save(
+                "gying",
+                "main",
+                &serde_json::json!({"status":"active", "cookie":"fixture"}),
+            )
+            .unwrap();
+        let mut config = Config::default();
+        config.search.providers = vec!["pansearch".into()];
+        config.search.providers_explicit = true;
+        config.providers.gying.base_url = "not a valid endpoint".into();
+        config.providers.panlian.blocked_clouds = vec!["invalid cloud".into()];
+        assert!(
+            configured_stateful(&store, &config, &ClientOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unrelated_config_save_preserves_provider_selection_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_dirs(
+            root.path().join("config"),
+            root.path().join("state"),
+            root.path().join("cache"),
+        );
+        for (input, expected) in [
+            ("", None),
+            ("[search]\nproviders = []", Some(Vec::<String>::new())),
+            (
+                "[search]\nproviders = ['gying']",
+                Some(vec!["gying".into()]),
+            ),
+        ] {
+            for selection in [None, Some(vec!["woniu".into()]), Some(vec![])] {
+                let mut config: Config = toml::from_str(input).unwrap();
+                if let Some(selection) = selection {
+                    config
+                        .apply_overrides(ConfigOverrides {
+                            providers: Some(selection),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                }
+                config.providers.woniu.base_url = "https://configured.example".into();
+                save_config(&paths, &config).unwrap();
+                let stored: toml::Value =
+                    toml::from_str(&std::fs::read_to_string(&paths.config_file).unwrap()).unwrap();
+                let actual = stored
+                    .get("search")
+                    .and_then(|search| search.get("providers"))
+                    .map(|value| {
+                        value
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|value| value.as_str().unwrap().to_owned())
+                            .collect::<Vec<_>>()
+                    });
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]
