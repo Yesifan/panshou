@@ -17,6 +17,8 @@ pub enum CloudType {
     #[serde(rename = "115")]
     One15,
     Pikpak,
+    Weiyun,
+    Lanzou,
     Xunlei,
     #[serde(rename = "123")]
     Pan123,
@@ -27,7 +29,7 @@ pub enum CloudType {
 }
 
 impl CloudType {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Baidu,
         Self::Aliyun,
         Self::Quark,
@@ -37,6 +39,8 @@ impl CloudType {
         Self::Mobile,
         Self::One15,
         Self::Pikpak,
+        Self::Weiyun,
+        Self::Lanzou,
         Self::Xunlei,
         Self::Pan123,
         Self::Magnet,
@@ -57,6 +61,8 @@ impl fmt::Display for CloudType {
             Self::Mobile => "mobile",
             Self::One15 => "115",
             Self::Pikpak => "pikpak",
+            Self::Weiyun => "weiyun",
+            Self::Lanzou => "lanzou",
             Self::Xunlei => "xunlei",
             Self::Pan123 => "123",
             Self::Magnet => "magnet",
@@ -81,6 +87,8 @@ impl FromStr for CloudType {
             "mobile" | "139" | "caiyun" => Ok(Self::Mobile),
             "115" | "one15" => Ok(Self::One15),
             "pikpak" => Ok(Self::Pikpak),
+            "weiyun" => Ok(Self::Weiyun),
+            "lanzou" => Ok(Self::Lanzou),
             "xunlei" => Ok(Self::Xunlei),
             "123" | "pan123" | "123pan" => Ok(Self::Pan123),
             "magnet" => Ok(Self::Magnet),

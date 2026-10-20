@@ -1,4 +1,5 @@
 use super::engine::CheckEvaluation;
+use super::protocol::{BoundedRequest, BoundedResponse};
 use super::protocol::{contains_any, json, number, string};
 use super::{CheckCloudType, CheckContext, CheckError, CheckItem, CheckState, LinkChecker};
 use async_trait::async_trait;
@@ -84,9 +85,9 @@ impl LinkChecker for TianyiChecker {
             ])
             .header("referer", n)
             .header("sign-type", "1")
-            .send()
+            .gated_send()
             .await?;
-        let body = r.bytes().await?;
+        let body = r.bounded_bytes().await?;
         let text = String::from_utf8_lossy(&body);
         if text.contains("<shareVO>")
             && (text.contains("<shareId>")

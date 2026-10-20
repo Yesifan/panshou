@@ -1,6 +1,54 @@
+trait ExecuteRequest {
+    async fn execute(self) -> anyhow::Result<reqwest::Response>;
+}
+impl ExecuteRequest for reqwest::RequestBuilder {
+    async fn execute(self) -> anyhow::Result<reqwest::Response> {
+        crate::http::execute(self).await
+    }
+}
+
+trait RetrySend {
+    async fn send_retry(self) -> anyhow::Result<reqwest::Response>;
+}
+impl RetrySend for reqwest::RequestBuilder {
+    async fn send_retry(self) -> anyhow::Result<reqwest::Response> {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200 << (attempt - 1))).await;
+            }
+            let request = self
+                .try_clone()
+                .expect("provider request body is replayable");
+            let result = request.execute().await.and_then(|r| {
+                if r.status().as_u16() == 200 {
+                    Ok(r)
+                } else {
+                    Err(anyhow::anyhow!("HTTP {}", r.status()))
+                }
+            });
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt == 2 => return Err(error),
+                Err(_) => {}
+            }
+        }
+        unreachable!("three attempts return a response or error")
+    }
+}
+
+async fn read_text(response: reqwest::Response) -> anyhow::Result<String> {
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(anyhow::anyhow!("cyg HTTP {status}"));
+    }
+    let body = crate::http::read_response(response, 16 * 1024 * 1024)
+        .await
+        .map_err(|error| error.context(format!("cyg response body HTTP {status}")))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use futures::future::join_all;
 use serde::Deserialize;
 use url::Url;
 
@@ -163,7 +211,7 @@ impl Provider for CygProvider {
             .append_pair("search", query);
         let response = tokio::time::timeout(
             ctx.timeout,
-            request(&ctx.client, url, &self.endpoints.base).send(),
+            request(&ctx.client, url, &self.endpoints.base).send_retry(),
         )
         .await
         .map_err(|_| ProviderError::Timeout)?
@@ -175,8 +223,7 @@ impl Provider for CygProvider {
             )));
         }
         let posts = parse_posts(
-            &response
-                .text()
+            &read_text(response)
                 .await
                 .map_err(|e| ProviderError::Network(e.to_string()))?,
         )?;
@@ -185,26 +232,77 @@ impl Provider for CygProvider {
                 .endpoints
                 .base
                 .join("wp-json/acg-studio/v1/download")
-                .ok()?;
+                .map_err(|error| ProviderError::Protocol(error.to_string()))?;
             url.query_pairs_mut()
                 .append_pair("id", &post.id.to_string());
             let response = request(&ctx.client, url, &self.endpoints.base)
-                .send()
+                .send_retry()
                 .await
-                .ok()?;
-            if !response.status().is_success() {
-                return None;
+                .map_err(super::c_support::network)?;
+            if response.status() != reqwest::StatusCode::OK {
+                return Err(ProviderError::Protocol(format!(
+                    "cyg download HTTP {}",
+                    response.status()
+                )));
             }
-            let links = parse_downloads(&response.text().await.ok()?).ok()?;
-            (!links.is_empty()).then(|| convert(post, links))
+            let body = read_text(response)
+                .await
+                .map_err(super::c_support::network)?;
+            let links = parse_downloads(&body)?;
+            Ok::<_, ProviderError>((!links.is_empty()).then(|| convert(post, links)))
         });
-        Ok(join_all(jobs).await.into_iter().flatten().collect())
+        super::collect_partial(ctx, jobs, 6).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn detail_status_is_preserved_and_completed_rows_survive() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        let mut posts: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/providers/cyg/success.json"
+        ))
+        .unwrap();
+        let mut second = posts[0].clone();
+        second["id"] = serde_json::json!(43);
+        posts.as_array_mut().unwrap().push(second);
+        Mock::given(path("/wp-json/wp/v2/posts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(posts))
+            .mount(&server)
+            .await;
+        Mock::given(path("/wp-json/acg-studio/v1/download"))
+            .and(wiremock::matchers::query_param("id", "42"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(include_str!(
+                "../../tests/fixtures/providers/cyg/download.json"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(path("/wp-json/acg-studio/v1/download"))
+            .and(wiremock::matchers::query_param("id", "43"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let base: Url = server.uri().parse().unwrap();
+        let provider = CygProvider::new(Endpoints { base });
+        let options = crate::http::ClientOptions {
+            redirect: crate::http::RedirectPolicy::None,
+            ..Default::default()
+        };
+        let client = crate::http::HttpClientFactory::new()
+            .client(&options)
+            .unwrap();
+        let ctx = SearchContext::new(client, std::time::Duration::from_secs(5));
+        let error = provider.search(&ctx, "一人之下").await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error}");
+        let rows = ctx.finish(Vec::new());
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].links.is_empty());
+    }
+
     #[test]
     fn success() {
         let p = parse_posts(include_str!(

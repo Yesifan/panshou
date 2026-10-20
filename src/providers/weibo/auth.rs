@@ -66,22 +66,23 @@ impl WeiboAuth {
 
     pub async fn begin(&self) -> Result<QrChallenge, ProviderError> {
         let callback = format!("STK_{}", chrono::Utc::now().timestamp_millis());
-        let response = self
-            .client
-            .get(self.endpoints.qr_info.clone())
-            .query(&[
-                ("entry", "miniblog"),
-                ("size", "180"),
-                ("callback", callback.as_str()),
-            ])
-            .header(header::USER_AGENT, USER_AGENT)
-            .header(header::REFERER, self.endpoints.web_origin.as_str())
-            .send()
-            .await
-            .map_err(network)?
-            .error_for_status()
-            .map_err(network)?;
-        let body = response.text().await.map_err(network)?;
+        let response = crate::http::execute(
+            self.client
+                .get(self.endpoints.qr_info.clone())
+                .query(&[
+                    ("entry", "miniblog"),
+                    ("size", "180"),
+                    ("callback", callback.as_str()),
+                ])
+                .header(header::USER_AGENT, USER_AGENT)
+                .timeout(std::time::Duration::from_secs(30))
+                .header(header::REFERER, self.endpoints.web_origin.as_str()),
+        )
+        .await
+        .map_err(network)?
+        .error_for_status()
+        .map_err(network)?;
+        let body = super::search::read_text(response).await?;
         let value = jsonp_value(&body)?;
         let qrid = value
             .pointer("/data/qrid")
@@ -93,20 +94,22 @@ impl WeiboAuth {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ProviderError::Protocol("Weibo QR response omitted image URL".into()))?;
         let image_url = qr_image_url(&self.endpoints.qr_image, image_url)?;
-        let image_png = self
-            .client
-            .get(image_url)
-            .header(header::USER_AGENT, USER_AGENT)
-            .header(header::REFERER, self.endpoints.web_origin.as_str())
-            .send()
+        let image_response = crate::http::execute(
+            self.client
+                .get(image_url)
+                .header(header::USER_AGENT, USER_AGENT)
+                .timeout(std::time::Duration::from_secs(30))
+                .header(header::REFERER, self.endpoints.web_origin.as_str()),
+        )
+        .await
+        .map_err(network)?
+        .error_for_status()
+        .map_err(network)?;
+        let image_png = crate::http::read_response(image_response, 16 * 1024 * 1024)
             .await
-            .map_err(network)?
-            .error_for_status()
-            .map_err(network)?
-            .bytes()
-            .await
-            .map_err(network)?
-            .to_vec();
+            .map_err(|_| {
+                ProviderError::Network("Weibo QR image read failed or exceeded limit".into())
+            })?;
         if !image_png.starts_with(b"\x89PNG\r\n\x1a\n") {
             return Err(ProviderError::Protocol(
                 "Weibo QR image endpoint did not return PNG data".into(),
@@ -120,22 +123,23 @@ impl WeiboAuth {
 
     pub async fn poll(&self, qrid: &str) -> Result<QrPoll, ProviderError> {
         let callback = format!("STK_{}", chrono::Utc::now().timestamp_millis());
-        let response = self
-            .client
-            .get(self.endpoints.qr_check.clone())
-            .query(&[
-                ("entry", "sso"),
-                ("qrid", qrid),
-                ("callback", callback.as_str()),
-            ])
-            .header(header::USER_AGENT, USER_AGENT)
-            .header(header::REFERER, self.endpoints.web_origin.as_str())
-            .send()
-            .await
-            .map_err(network)?
-            .error_for_status()
-            .map_err(network)?;
-        let value = jsonp_value(&response.text().await.map_err(network)?)?;
+        let response = crate::http::execute(
+            self.client
+                .get(self.endpoints.qr_check.clone())
+                .query(&[
+                    ("entry", "sso"),
+                    ("qrid", qrid),
+                    ("callback", callback.as_str()),
+                ])
+                .header(header::USER_AGENT, USER_AGENT)
+                .timeout(std::time::Duration::from_secs(30))
+                .header(header::REFERER, self.endpoints.web_origin.as_str()),
+        )
+        .await
+        .map_err(network)?
+        .error_for_status()
+        .map_err(network)?;
+        let value = jsonp_value(&super::search::read_text(response).await?)?;
         let (status, message, alt) = classify_poll(&value)?;
         match status {
             QrStatus::Success => {
@@ -159,25 +163,29 @@ impl WeiboAuth {
     async fn initialize_cookie(&self, start: &str) -> Result<String, ProviderError> {
         if let Some(session) = &self.session {
             let start = Url::parse(start).map_err(|e| ProviderError::Protocol(e.to_string()))?;
-            session
-                .client()
-                .get(start)
-                .header(header::USER_AGENT, USER_AGENT)
-                .send()
+            crate::http::execute(
+                session
+                    .client()
+                    .get(start)
+                    .header(header::USER_AGENT, USER_AGENT)
+                    .timeout(std::time::Duration::from_secs(30)),
+            )
+            .await
+            .map_err(network)?
+            .error_for_status()
+            .map_err(network)?;
+            for url in [&self.endpoints.web_origin, &self.endpoints.mobile_origin] {
+                crate::http::execute(
+                    session
+                        .client()
+                        .get(url.clone())
+                        .header(header::USER_AGENT, USER_AGENT)
+                        .timeout(std::time::Duration::from_secs(30)),
+                )
                 .await
                 .map_err(network)?
                 .error_for_status()
                 .map_err(network)?;
-            for url in [&self.endpoints.web_origin, &self.endpoints.mobile_origin] {
-                session
-                    .client()
-                    .get(url.clone())
-                    .header(header::USER_AGENT, USER_AGENT)
-                    .send()
-                    .await
-                    .map_err(network)?
-                    .error_for_status()
-                    .map_err(network)?;
             }
             let mut values = Vec::new();
             for url in [&self.endpoints.web_origin, &self.endpoints.mobile_origin] {
@@ -196,13 +204,14 @@ impl WeiboAuth {
         let mut next = Url::parse(start).map_err(|e| ProviderError::Protocol(e.to_string()))?;
         let mut cookies = BTreeMap::<String, String>::new();
         for _ in 0..10 {
-            let response = self
-                .client
-                .get(next.clone())
-                .header(header::USER_AGENT, USER_AGENT)
-                .send()
-                .await
-                .map_err(network)?;
+            let response = crate::http::execute(
+                self.client
+                    .get(next.clone())
+                    .header(header::USER_AGENT, USER_AGENT)
+                    .timeout(std::time::Duration::from_secs(30)),
+            )
+            .await
+            .map_err(network)?;
             collect_cookies(&response, &mut cookies);
             if !response.status().is_redirection() {
                 break;
@@ -220,14 +229,15 @@ impl WeiboAuth {
         }
         // Seed both sites and collect their short-lived cookies.
         for url in [&self.endpoints.web_origin, &self.endpoints.mobile_origin] {
-            let response = self
-                .client
-                .get(url.clone())
-                .header(header::USER_AGENT, USER_AGENT)
-                .header(header::COOKIE, cookie_header(&cookies))
-                .send()
-                .await
-                .map_err(network)?;
+            let response = crate::http::execute(
+                self.client
+                    .get(url.clone())
+                    .header(header::USER_AGENT, USER_AGENT)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .header(header::COOKIE, cookie_header(&cookies)),
+            )
+            .await
+            .map_err(network)?;
             collect_cookies(&response, &mut cookies);
         }
         if cookies.is_empty() {
@@ -333,13 +343,43 @@ fn number(value: &serde_json::Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_str()?.parse().ok())
 }
 
-fn network(error: reqwest::Error) -> ProviderError {
-    ProviderError::Network(error.to_string())
+fn network(_: impl std::fmt::Display) -> ProviderError {
+    ProviderError::Network("Weibo HTTP request failed".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn qr_image_over_limit_is_rejected_without_signed_data_in_error() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        Mock::given(path("/info")).respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"qrid":"fixture-qr","image":"https://example.invalid/image?sign=fixture-signature"}}"#
+        )).mount(&server).await;
+        Mock::given(path("/image"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![0u8; 16 * 1024 * 1024 + 1]),
+            )
+            .mount(&server)
+            .await;
+        let endpoints = WeiboEndpoints {
+            qr_info: Url::parse(&format!("{}/info", server.uri())).unwrap(),
+            qr_image: Url::parse(&format!("{}/image", server.uri())).unwrap(),
+            ..WeiboEndpoints::default()
+        };
+        let auth = WeiboAuth::new(Client::new(), endpoints);
+        let error = auth
+            .begin()
+            .await
+            .err()
+            .expect("oversized QR image must fail")
+            .to_string();
+        assert!(error.contains("exceeded limit"));
+        assert!(!error.contains("fixture-signature"));
+        assert!(!error.contains("fixture-qr"));
+    }
 
     #[test]
     fn jsonp_is_accepted_and_malformed_input_is_rejected() {

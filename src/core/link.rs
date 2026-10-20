@@ -14,18 +14,20 @@ fn link_regex() -> &'static Regex {
         magnet:\?xt=urn:btih:[a-z0-9]+(?:&[^\s<>"']*)?
         |ed2k://\|file\|[^|]+\|\d+\|[a-f0-9]+\|/?
         |https?://(?:www\.)?(?:
-          pan\.baidu\.com/s/[a-z0-9_-]+(?:\?pwd=[a-z0-9]{4})?
+          pan\.baidu\.com/s/[a-z0-9_-]+
          |(?:alipan|aliyundrive)\.com/s/[a-z0-9_-]+
          |pan\.quark\.cn/s/[a-z0-9_-]+
          |guangyapan\.com/s/[a-z0-9_-]+
          |cloud\.189\.cn/t/[a-z0-9%_-]+(?:（访问码：[a-z0-9]+）|%EF%BC%88%E8%AE%BF%E9%97%AE%E7%A0%81%EF%BC%9A[a-z0-9]+%EF%BC%89)?
-         |drive\.uc\.cn/s/[a-z0-9_-]+(?:\?public=\d)?
+         |(?:drive|fast)\.uc\.cn/s/[a-z0-9_-]+(?:\?public=\d)?
          |(?:yun\.139\.com/shareweb/\#/w/i/[a-z0-9_-]+|caiyun\.139\.com/(?:w/i/[a-z0-9_-]+|m/i\?[^\s<>"']+)|caiyun\.feixin\.10086\.cn/[a-z0-9_-]+)
-         |(?:115\.com|115cdn\.com|anxia\.com)/s/[a-z0-9_-]+(?:\?password=[a-z0-9]{4})?
+         |(?:115\.com|115cdn\.com|anxia\.com)/s/[a-z0-9_-]+
+         |(?:[a-z0-9-]+\.)*weiyun\.com/[a-z0-9_/?=&%-]+
+         |(?:[a-z0-9-]+\.)*lanzou[a-z]?\.com/[a-z0-9_/?=&%-]+
          |mypikpak\.com/s/[a-z0-9_-]+
-         |pan\.xunlei\.com/s/[a-z0-9_-]+(?:\?pwd=[a-z0-9]{4})?\#?
+         |pan\.xunlei\.com/s/[a-z0-9_-]+\#?
          |(?:123684|123685|123865|123912|123pan|123592)\.(?:com|cn)/s/[a-z0-9_-]+(?:\?(?:%E6%8F%90%E5%8F%96%E7%A0%81|提取码)[:：][a-z0-9]+)?
-        )"#,
+        )(?:[?&][^\s<>"\']*)?"#,
     ).expect("the built-in link regex is valid"))
 }
 
@@ -54,37 +56,73 @@ pub fn detect_cloud_type(raw_url: &str) -> CloudType {
     if value.starts_with("ed2k:") {
         return CloudType::Ed2k;
     }
-    if value.contains("pan.baidu.com") {
+    let Ok(url) = Url::parse(&value) else {
+        return CloudType::Others;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return CloudType::Others;
+    }
+    let Some(host) = url.host_str() else {
+        return CloudType::Others;
+    };
+    if ["pan.baidu.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::Baidu;
     }
-    if value.contains("alipan.com") || value.contains("aliyundrive.com") {
+    if ["alipan.com", "aliyundrive.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::Aliyun;
     }
-    if value.contains("pan.quark.cn") {
+    if ["pan.quark.cn"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::Quark;
     }
-    if value.contains("guangyapan.com") {
+    if ["guangyapan.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::Guangya;
     }
-    if value.contains("cloud.189.cn") {
+    if ["cloud.189.cn"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::Tianyi;
     }
-    if value.contains("drive.uc.cn") {
+    if ["drive.uc.cn", "fast.uc.cn"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::Uc;
     }
-    if value.contains("yun.139.com")
-        || value.contains("caiyun.139.com")
-        || value.contains("caiyun.feixin.10086.cn")
+    if ["yun.139.com", "caiyun.139.com", "caiyun.feixin.10086.cn"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
     {
         return CloudType::Mobile;
     }
-    if value.contains("115.com") || value.contains("115cdn.com") || value.contains("anxia.com") {
+    if ["115.com", "115cdn.com", "anxia.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::One15;
     }
-    if value.contains("mypikpak.com") {
+    if ["mypikpak.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::Pikpak;
     }
-    if value.contains("pan.xunlei.com") {
+    if ["pan.xunlei.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
         return CloudType::Xunlei;
     }
     if [
@@ -97,9 +135,45 @@ pub fn detect_cloud_type(raw_url: &str) -> CloudType {
         "123592.com",
     ]
     .iter()
-    .any(|domain| value.contains(domain))
+    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
     {
         return CloudType::Pan123;
+    }
+    if ["weiyun.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
+        return CloudType::Weiyun;
+    }
+    if [
+        "lanzou.com",
+        "lanzoui.com",
+        "lanzoux.com",
+        "lanzoub.com",
+        "lanzouc.com",
+        "lanzoue.com",
+        "lanzouf.com",
+        "lanzoug.com",
+        "lanzouh.com",
+        "lanzouj.com",
+        "lanzouk.com",
+        "lanzoul.com",
+        "lanzoum.com",
+        "lanzoun.com",
+        "lanzoup.com",
+        "lanzouq.com",
+        "lanzous.com",
+        "lanzout.com",
+        "lanzouu.com",
+        "lanzouv.com",
+        "lanzouw.com",
+        "lanzouy.com",
+        "lanzouz.com",
+    ]
+    .iter()
+    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
+        return CloudType::Lanzou;
     }
     CloudType::Others
 }
@@ -180,6 +254,63 @@ pub fn extract_password(content: &str, url: &str) -> Option<String> {
         .map(|m| m.as_str().to_owned())
 }
 
+/// URL codes win; otherwise inspect only this link's UTF-8-safe local window.
+pub fn extract_password_for_link(context: &str, url: &str, label: &str) -> Option<String> {
+    if let Some(code) = extract_password("", url) {
+        return Some(code);
+    }
+    if let Some(code) = password_near(label, url) {
+        return Some(code);
+    }
+    if let Some(code) = password_near(context, url) {
+        return Some(code);
+    }
+    let codes: std::collections::HashSet<_> = text_password_regex()
+        .captures_iter(context)
+        .filter_map(|c| c.get(1).map(|m| m.as_str()))
+        .collect();
+    if codes.len() != 1 {
+        return None;
+    }
+    // A code attached to another link is not a message-wide shared code.
+    if let Some(first_link) = link_regex().find(context)
+        && !text_password_regex().is_match(&context[..first_link.start()])
+    {
+        return None;
+    }
+    codes.into_iter().next().map(str::to_owned)
+}
+
+fn password_near(context: &str, url: &str) -> Option<String> {
+    let base = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let bare = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or(base);
+    let no_www = bare.strip_prefix("www.").unwrap_or(bare);
+    let mut anchors = vec![base.to_owned(), no_www.to_owned(), format!("www.{no_www}")];
+    if let Some(last) = base.rsplit('/').next().filter(|last| last.len() > 5) {
+        anchors.push(format!("/{last}"));
+    }
+    let tail = anchors
+        .iter()
+        .find_map(|anchor| context.find(anchor).map(|i| &context[i + anchor.len()..]));
+    let window = match tail {
+        Some(tail) => tail.split("http").next().unwrap_or(""),
+        None if context.len() <= 120 && !context.contains("http") => context,
+        None => return None,
+    };
+    let mut end = window.len().min(60);
+    while !window.is_char_boundary(end) {
+        end -= 1;
+    }
+    extract_password(&window[..end], "")
+}
+
 pub fn extract_links(text: &str) -> Vec<Link> {
     let matches: Vec<_> = link_regex().find_iter(text).collect();
     let mut positions = HashMap::<String, usize>::new();
@@ -188,18 +319,14 @@ pub fn extract_links(text: &str) -> Vec<Link> {
     for found in &matches {
         let url = normalize_url(found.as_str());
         let key = canonical_url_key(&url);
-        let line_start = text[..found.start()].rfind('\n').map_or(0, |i| i + 1);
-        let line_end = text[found.end()..]
-            .find('\n')
-            .map_or(text.len(), |i| found.end() + i);
-        let line = &text[line_start..line_end];
-        let password = extract_password(line, &url).or_else(|| {
-            (matches.len() == 1)
-                .then(|| extract_password(text, &url))
-                .flatten()
-        });
+        if detect_cloud_type(&url) == CloudType::Others {
+            continue;
+        }
+        let password = extract_password_for_link(text, &url, "");
         if let Some(&position) = positions.get(&key) {
-            if links[position].password.is_none() && password.is_some() {
+            if (extract_password("", &url).is_some() || links[position].password.is_none())
+                && password.is_some()
+            {
                 links[position].password = password;
                 if url_password_regex().is_match(&url) {
                     links[position].url = url;
@@ -230,7 +357,9 @@ pub fn associate_work_titles(links: &mut [Link], text: &str, default_title: Opti
         }
         let urls = link_regex().find_iter(line).collect::<Vec<_>>();
         if urls.is_empty() {
-            previous_text = Some(clean_title(line));
+            if let Some(title) = message_title_line(line) {
+                previous_text = Some(title);
+            }
             continue;
         }
         let prefix = line[..urls[0].start()].trim();
@@ -252,6 +381,36 @@ pub fn associate_work_titles(links: &mut [Link], text: &str, default_title: Opti
                 .or_else(|| default_title.map(str::to_owned));
         }
     }
+}
+
+pub fn message_title_line(line: &str) -> Option<String> {
+    static DATE: OnceLock<Regex> = OnceLock::new();
+    let line = line.trim();
+    let date = DATE.get_or_init(|| Regex::new(r"^(?:📅\s*)?(?:(?:\d{1,4}年)?\d{1,2}月\d{1,2}日|\d{1,4}[-/.]\d{1,2}[-/.]\d{1,2})(?:\s|$)").unwrap());
+    if line.is_empty()
+        || date.is_match(line)
+        || (line.starts_with('#') && !line.contains("名称"))
+        || [
+            "类型：",
+            "分享：",
+            "网盘：",
+            "简介：",
+            "描述：",
+            "更多资源：",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    {
+        return None;
+    }
+    let title = clean_title(line);
+    let end = ["简介", "描述"]
+        .iter()
+        .filter_map(|marker| title.find(marker))
+        .min()
+        .unwrap_or(title.len());
+    let title = title[..end].trim();
+    (!title.is_empty()).then(|| title.to_owned())
 }
 
 fn inline_title(prefix: &str) -> Option<String> {
@@ -288,13 +447,11 @@ fn inline_title(prefix: &str) -> Option<String> {
 }
 
 fn clean_title(value: &str) -> String {
+    let value = value.trim().trim_start_matches(['#', '-', '•', '·']).trim();
     value
-        .trim()
-        .trim_start_matches(['#', '-', '•', '·'])
-        .trim()
         .strip_prefix("名称：")
-        .or_else(|| value.trim().strip_prefix("标题："))
-        .unwrap_or(value.trim())
+        .or_else(|| value.strip_prefix("标题："))
+        .unwrap_or(value)
         .trim()
         .to_owned()
 }

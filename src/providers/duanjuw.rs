@@ -1,7 +1,55 @@
+trait ExecuteRequest {
+    async fn execute(self) -> anyhow::Result<reqwest::Response>;
+}
+impl ExecuteRequest for reqwest::RequestBuilder {
+    async fn execute(self) -> anyhow::Result<reqwest::Response> {
+        crate::http::execute(self).await
+    }
+}
+
+trait RetrySend {
+    async fn send_retry(self) -> anyhow::Result<reqwest::Response>;
+}
+impl RetrySend for reqwest::RequestBuilder {
+    async fn send_retry(self) -> anyhow::Result<reqwest::Response> {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200 << (attempt - 1))).await;
+            }
+            let request = self
+                .try_clone()
+                .expect("provider request body is replayable");
+            let result = request.execute().await.and_then(|r| {
+                if r.status().as_u16() == 200 {
+                    Ok(r)
+                } else {
+                    Err(anyhow::anyhow!("HTTP {}", r.status()))
+                }
+            });
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt == 2 => return Err(error),
+                Err(_) => {}
+            }
+        }
+        unreachable!("three attempts return a response or error")
+    }
+}
+
+async fn read_text(response: reqwest::Response) -> anyhow::Result<String> {
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(anyhow::anyhow!("duanjuw HTTP {status}"));
+    }
+    let body = crate::http::read_response(response, 16 * 1024 * 1024)
+        .await
+        .map_err(|error| error.context(format!("duanjuw response body HTTP {status}")))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 use crate::core::{CloudType, Link, ProviderError, SearchResult, Source};
 use crate::providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext};
 use async_trait::async_trait;
-use futures::future::join_all;
 use regex::Regex;
 use scraper::{Html, Selector};
 use url::Url;
@@ -48,8 +96,10 @@ struct Pending {
 fn extract_links(fragment: &str) -> Vec<Link> {
     let doc = Html::parse_fragment(fragment);
     let selector = Selector::parse("a[href]").expect("selector");
-    let pwd =
-        Regex::new(r"(?i)(?:提取码|密码|pwd|code)\s*[=:：]?\s*([0-9A-Za-z]+)").expect("regex");
+    static PWD_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)(?:提取码|密码|pwd|code)\s*[=:：]?\s*([0-9A-Za-z]+)").expect("regex")
+    });
+    let pwd = &*PWD_RE;
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for a in doc.select(&selector) {
@@ -122,8 +172,10 @@ fn parse_search(body: &str, base: &Url) -> Result<Vec<Pending>, ProviderError> {
             .replace("<br>", "\n")
             .replace("<br/>", "\n")
             .replace("<br />", "\n");
-        let starts = Regex::new(r"(?m)(?:^|\n)\s*\d+\s*[、.．]\s*《")
-            .expect("regex")
+        static STARTS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r"(?m)(?:^|\n)\s*\d+\s*[、.．]\s*《").expect("regex")
+        });
+        let starts = STARTS_RE
             .find_iter(&html)
             .map(|m| m.start())
             .collect::<Vec<_>>();
@@ -232,7 +284,7 @@ impl Provider for DuanjuwProvider {
             .append_pair("page", "1");
         let r = tokio::time::timeout(
             ctx.timeout,
-            request(&ctx.client, url, &self.endpoints.base).send(),
+            request(&ctx.client, url, &self.endpoints.base).send_retry(),
         )
         .await
         .map_err(|_| ProviderError::Timeout)?
@@ -241,34 +293,73 @@ impl Provider for DuanjuwProvider {
             return Err(ProviderError::Protocol(format!("HTTP {}", r.status())));
         }
         let rows = parse_search(
-            &r.text()
+            &read_text(r)
                 .await
                 .map_err(|e| ProviderError::Network(e.to_string()))?,
             &self.endpoints.base,
         )?;
         let jobs = rows.into_iter().map(|mut p| async move {
             let Some(url) = p.detail else {
-                return Some(p.result);
+                return Ok(Some(p.result));
             };
             let r = request(&ctx.client, url, &self.endpoints.base)
-                .send()
+                .send_retry()
                 .await
-                .ok()?;
-            let text = r.text().await.ok()?;
+                .map_err(super::c_support::network)?;
+            if r.status() != reqwest::StatusCode::OK {
+                return Err(ProviderError::Protocol(format!(
+                    "duanjuw detail HTTP {}",
+                    r.status()
+                )));
+            }
+            let text = read_text(r).await.map_err(super::c_support::network)?;
             let (links, content) = parse_detail(&text);
             if links.is_empty() {
-                return None;
+                return Ok(None);
             }
             p.result.links = links;
             p.result.content = content;
-            Some(p.result)
+            Ok::<_, ProviderError>(Some(p.result))
         });
-        Ok(join_all(jobs).await.into_iter().flatten().collect())
+        super::collect_partial(ctx, jobs, 6).await
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn detail_status_is_preserved_and_completed_rows_survive() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        Mock::given(path("/so/search.php")).respond_with(ResponseTemplate::new(200).set_body_string(r#"<ul><li class="col-6"><h3 class="f-14"><a href="/good">仙逆</a></h3></li><li class="col-6"><h3 class="f-14"><a href="/failed">仙逆 2</a></h3></li></ul>"#)).mount(&server).await;
+        Mock::given(path("/good"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(include_str!(
+                "../../tests/fixtures/providers/duanjuw/detail_scope.html"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(path("/failed"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let base: Url = server.uri().parse().unwrap();
+        let provider = DuanjuwProvider::new(Endpoints { base });
+        let options = crate::http::ClientOptions {
+            redirect: crate::http::RedirectPolicy::None,
+            ..Default::default()
+        };
+        let client = crate::http::HttpClientFactory::new()
+            .client(&options)
+            .unwrap();
+        let ctx = SearchContext::new(client, std::time::Duration::from_secs(5));
+        let error = provider.search(&ctx, "仙逆").await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error}");
+        let rows = ctx.finish(Vec::new());
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].links.is_empty());
+    }
+
     #[test]
     fn success() {
         let b = Url::parse("https://sm3.cc/").unwrap();

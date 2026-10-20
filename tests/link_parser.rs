@@ -28,6 +28,20 @@ fn provider_errors_have_machine_readable_kinds() {
 }
 
 #[test]
+fn fast_uc_shares_are_recognized_without_accepting_lookalikes() {
+    let url = "https://fast.uc.cn/s/abc123?pwd=a1b2";
+    assert_eq!(detect_cloud_type(url), CloudType::Uc);
+    let links = extract_links(url);
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].cloud_type, CloudType::Uc);
+    assert_eq!(links[0].password.as_deref(), Some("a1b2"));
+    assert_eq!(
+        detect_cloud_type("https://fast.uc.cn.evil.test/s/abc123"),
+        CloudType::Others
+    );
+}
+
+#[test]
 fn detects_every_supported_cloud() {
     let cases = [
         ("https://pan.baidu.com/s/abc_1", CloudType::Baidu),

@@ -1,5 +1,6 @@
 use super::engine::CheckEvaluation;
 use super::normalize::last_path_segment;
+use super::protocol::{BoundedRequest, BoundedResponse};
 use super::protocol::{json, number, string};
 use super::{CheckCloudType, CheckContext, CheckError, CheckItem, CheckState, LinkChecker};
 use async_trait::async_trait;
@@ -30,12 +31,12 @@ impl LinkChecker for Pan123Checker {
             .client
             .get(&self.endpoint)
             .query(&[("shareKey", key)])
-            .send()
+            .gated_send()
             .await?;
         if r.status() == reqwest::StatusCode::FORBIDDEN {
             return Ok(CheckEvaluation::new(CheckState::Ok, "链接有效"));
         }
-        let v = json(&r.bytes().await?)?;
+        let v = json(&r.bounded_bytes().await?)?;
         Ok(if number(&v, &["code"]) == 0 {
             CheckEvaluation::new(CheckState::Ok, "链接有效")
         } else if v

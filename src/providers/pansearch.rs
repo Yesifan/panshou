@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::{StreamExt, stream};
 use regex::Regex;
 use scraper::{Html, Selector};
@@ -136,7 +136,15 @@ fn convert(item: Item, query: &str) -> Option<SearchResult> {
         .to_owned();
     let datetime = DateTime::parse_from_rfc3339(&item.time)
         .ok()
-        .map(|t| t.with_timezone(&Utc));
+        .map(|t| t.with_timezone(&Utc))
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(&item.time, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|t| t.and_utc())
+        });
+    if datetime.is_none() && !item.time.is_empty() {
+        tracing::warn!(provider = "pansearch", "无法解析资源时间；保留无时间结果");
+    }
     let mut link = Link::new(parsed.as_str().trim_end_matches('#'));
     let normalized_pan = item.pan.trim().to_ascii_lowercase();
     let pan = if normalized_pan == "ali" {
@@ -181,29 +189,32 @@ impl Provider for Pansearch {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
-        let response = ctx
-            .client
-            .get(self.endpoints.website.clone())
-            .header("user-agent", UA)
-            .header(
-                "accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            )
-            .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .header("upgrade-insecure-requests", "1")
-            .header("cache-control", "max-age=0")
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let response = crate::http::execute(
+            ctx.client
+                .get(self.endpoints.website.clone())
+                .header("user-agent", UA)
+                .header(
+                    "accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                )
+                .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("upgrade-insecure-requests", "1")
+                .header("cache-control", "max-age=0"),
+        )
+        .await
+        .map_err(|e| ProviderError::Network(e.to_string()))?;
         if response.status().as_u16() == 403 {
             return Err(ProviderError::Blocked);
         }
-        let page = response
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let page = crate::http::read_response(
+            response
+                .error_for_status()
+                .map_err(|e| ProviderError::Network(e.without_url().to_string()))?,
+            16 << 20,
+        )
+        .await
+        .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let page = String::from_utf8_lossy(&page);
         let id = build_id(&page)?;
         let origin = self.endpoints.website.origin().ascii_serialization();
         let base = format!("{origin}/_next/data/{id}/search.json");
@@ -218,30 +229,42 @@ impl Provider for Pansearch {
                 u.query_pairs_mut()
                     .append_pair("keyword", &query)
                     .append_pair("offset", &offset.to_string());
-                let r = client
-                    .get(u)
-                    .header("user-agent", UA)
-                    .header("referer", format!("{origin}/"))
-                    .header("accept", "application/json, text/plain, */*")
-                    .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-                    .header("cache-control", "no-cache")
-                    .header("pragma", "no-cache")
-                    .send()
-                    .await
-                    .map_err(|e| ProviderError::Network(e.to_string()))?;
+                let r = crate::http::execute(
+                    client
+                        .get(u)
+                        .header("user-agent", UA)
+                        .header("referer", format!("{origin}/"))
+                        .header("accept", "application/json, text/plain, */*")
+                        .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+                        .header("cache-control", "no-cache")
+                        .header("pragma", "no-cache"),
+                )
+                .await
+                .map_err(|e| ProviderError::Network(e.to_string()))?;
                 if r.status().as_u16() == 403 {
                     return Err(ProviderError::Blocked);
                 }
                 if r.status().as_u16() == 429 {
                     return Err(ProviderError::RateLimited);
                 }
-                parse_api(
-                    &r.error_for_status()
-                        .map_err(|e| ProviderError::Network(e.to_string()))?
-                        .text()
-                        .await
-                        .map_err(|e| ProviderError::Network(e.to_string()))?,
+                let bytes = crate::http::read_response(
+                    r.error_for_status()
+                        .map_err(|e| ProviderError::Network(e.without_url().to_string()))?,
+                    16 << 20,
                 )
+                .await
+                .map_err(|e| ProviderError::Network(e.to_string()))?;
+                let api = parse_api(&String::from_utf8_lossy(&bytes))?;
+                ctx.publish(
+                    api.page_props
+                        .data
+                        .data
+                        .iter()
+                        .cloned()
+                        .filter_map(|item| convert(item, &query))
+                        .collect(),
+                );
+                Ok::<_, ProviderError>(api)
             }
         };
         let first = fetch(0).await?;
@@ -251,8 +274,15 @@ impl Provider for Pansearch {
             .buffer_unordered(4)
             .collect::<Vec<_>>()
             .await;
-        for api in rest.into_iter().flatten() {
-            items.extend(api.page_props.data.data);
+        let mut error = None;
+        for outcome in rest {
+            match outcome {
+                Ok(api) => items.extend(api.page_props.data.data),
+                Err(e) => error = Some(e),
+            }
+        }
+        if let Some(e) = error {
+            return Err(e);
         }
         let mut seen = HashSet::new();
         Ok(items
@@ -287,6 +317,25 @@ mod tests {
                 .as_deref(),
             Some("a1b2")
         );
+    }
+    #[test]
+    fn legacy_utc_timestamp_and_invalid_timestamp() {
+        let api = parse_api(include_str!(
+            "../../tests/fixtures/providers/pansearch/success.json"
+        ))
+        .unwrap();
+        let mut item = api.page_props.data.data[0].clone();
+        item.time = "2026-10-12 13:14:15".into();
+        assert_eq!(
+            convert(item.clone(), "仙逆")
+                .unwrap()
+                .datetime
+                .unwrap()
+                .to_rfc3339(),
+            "2026-10-12T13:14:15+00:00"
+        );
+        item.time = "not a time".into();
+        assert!(convert(item, "仙逆").unwrap().datetime.is_none());
     }
     #[test]
     fn fixture_empty() {

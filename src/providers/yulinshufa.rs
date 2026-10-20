@@ -242,15 +242,20 @@ impl Provider for Yulinshufa {
             .join(&format!("/plus/search.php?q={}", gbk_escape(query)))
             .map_err(|e| ProviderError::Protocol(e.to_string()))?;
         let referer = format!("{}/", self.endpoints.base.as_str().trim_end_matches('/'));
-        let bytes = browser_headers(ctx.client.get(url), &referer)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .bytes()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let bytes = super::c_support::request(
+            || {
+                browser_headers(
+                    ctx.client
+                        .get(url.clone())
+                        .timeout(std::time::Duration::from_secs(20).min(ctx.timeout)),
+                    &referer,
+                )
+            },
+            3,
+            std::time::Duration::from_millis(200),
+            super::c_support::BODY_LIMIT,
+        )
+        .await?;
         let candidates = parse_candidates(&decode_gbk(&bytes), &self.endpoints.base)?;
         let base = self.endpoints.base.clone();
         let client = ctx.client.clone();
@@ -260,16 +265,25 @@ impl Provider for Yulinshufa {
             let base = base.clone();
             let referer = referer.clone();
             async move {
-                let bytes = browser_headers(client.get(c.url.clone()), &referer)
-                    .send()
-                    .await
-                    .map_err(|e| ProviderError::Network(e.to_string()))?
-                    .error_for_status()
-                    .map_err(|e| ProviderError::Network(e.to_string()))?
-                    .bytes()
-                    .await
-                    .map_err(|e| ProviderError::Network(e.to_string()))?;
-                parse_detail(&decode_gbk(&bytes), &c, &base)
+                let bytes = super::c_support::request(
+                    || {
+                        browser_headers(
+                            client
+                                .get(c.url.clone())
+                                .timeout(std::time::Duration::from_secs(30).min(ctx.timeout)),
+                            &referer,
+                        )
+                    },
+                    3,
+                    std::time::Duration::from_millis(200),
+                    super::c_support::BODY_LIMIT,
+                )
+                .await?;
+                let row = parse_detail(&decode_gbk(&bytes), &c, &base)?;
+                if let Some(row) = &row {
+                    ctx.publish(vec![row.clone()]);
+                }
+                Ok(row)
             }
         }))
         .buffered(6)
@@ -277,21 +291,20 @@ impl Provider for Yulinshufa {
         .await;
         let mut results = Vec::new();
         let mut first_error = None;
-        let mut successful_details = 0usize;
         for detail in found {
             match detail {
-                Ok(result) => {
-                    successful_details += 1;
-                    results.extend(result);
+                Ok(Some(result)) => results.push(result),
+                Ok(None) => {
+                    first_error.get_or_insert_with(|| {
+                        ProviderError::Unavailable("detail contained no usable links".into())
+                    });
                 }
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
             };
         }
-        if successful_details == 0
-            && let Some(error) = first_error
-        {
+        if let Some(error) = first_error {
             return Err(error);
         }
         Ok(results)
@@ -301,6 +314,81 @@ impl Provider for Yulinshufa {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn list_and_details_retry_without_losing_gbk() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{path, path_regex},
+        };
+        let server = MockServer::start().await;
+        let list_count = Arc::new(AtomicUsize::new(0));
+        let n = list_count.clone();
+        Mock::given(path("/plus/search.php"))
+            .respond_with(move |_: &wiremock::Request| {
+                if n.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(
+                        include_bytes!(
+                            "../../tests/fixtures/providers/yulinshufa/success-list.gbk"
+                        )
+                        .to_vec(),
+                    )
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let detail_count = Arc::new(AtomicUsize::new(0));
+        let n = detail_count.clone();
+        Mock::given(path_regex(r"/xz/.*"))
+            .respond_with(move |_: &wiremock::Request| {
+                if n.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(503)
+                } else {
+                    let (bytes, _, _) = GBK.encode(include_str!(
+                        "../../tests/fixtures/providers/yulinshufa/success-detail.html"
+                    ));
+                    ResponseTemplate::new(200).set_body_bytes(bytes.into_owned())
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let provider = Yulinshufa::new(Endpoints {
+            base: Url::parse(&server.uri()).unwrap(),
+        });
+        let ctx = SearchContext::new(reqwest::Client::new(), std::time::Duration::from_secs(5));
+        let rows = provider.search(&ctx, "仙逆").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(list_count.load(Ordering::SeqCst), 3);
+        assert_eq!(detail_count.load(Ordering::SeqCst), 3);
+    }
+    #[tokio::test]
+    async fn exhausted_list_is_http_error() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let p = Yulinshufa::new(Endpoints {
+            base: Url::parse(&server.uri()).unwrap(),
+        });
+        let ctx = SearchContext::new(reqwest::Client::new(), std::time::Duration::from_secs(5));
+        assert!(
+            p.search(&ctx, "仙逆")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("503")
+        );
+    }
     #[test]
     fn fixture_success() {
         let base = Endpoints::default().base;

@@ -79,6 +79,32 @@ fn duplicate_link_newest_metadata_wins_but_position_is_stable() {
 }
 
 #[test]
+fn newer_metadata_never_clears_an_existing_password() {
+    for replacement in [None, Some(String::new()), Some("   ".into())] {
+        let mut old = result(
+            "old",
+            Source::provider("first"),
+            "旧标题",
+            &["https://pan.baidu.com/s/abc"],
+        );
+        old.datetime = Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+        old.links[0].password = Some("abcd".into());
+        let mut new = result(
+            "new",
+            Source::provider("later"),
+            "新标题",
+            &["https://pan.baidu.com/s/abc"],
+        );
+        new.datetime = Some(Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap());
+        new.links[0].password = replacement;
+        let merged = merge_links(&[old, new], None, &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].note, "新标题");
+        assert_eq!(merged[0].password.as_deref(), Some("abcd"));
+    }
+}
+
+#[test]
 fn work_title_beats_message_title_and_filters_per_link() {
     let mut item = result(
         "1",

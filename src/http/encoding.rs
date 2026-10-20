@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum DecodeError {
     #[error("failed to read HTTP response: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("failed to read bounded HTTP response: {0}")]
+    Body(#[source] anyhow::Error),
     #[error("response is not valid {encoding} text")]
     Malformed { encoding: &'static str },
 }
@@ -40,7 +42,9 @@ pub async fn response_text(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let bytes = response.bytes().await?;
+    let bytes = super::read_response(response, super::DEFAULT_RESPONSE_LIMIT)
+        .await
+        .map_err(DecodeError::Body)?;
     decode_body(&bytes, content_type.as_deref(), fallback)
 }
 

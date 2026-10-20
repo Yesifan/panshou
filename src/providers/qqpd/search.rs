@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -19,6 +19,16 @@ use crate::{
     providers::{AuthKind, KeywordFilterMode, Provider, ProviderMeta, SearchContext},
     state::StateStore,
 };
+
+#[cfg(test)]
+#[path = "delivery_tests.rs"]
+mod delivery_tests;
+#[path = "index.rs"]
+mod index;
+#[cfg(test)]
+#[path = "upstream_tests.rs"]
+mod upstream_tests;
+use index::{request_api, validate_api};
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
@@ -42,7 +52,9 @@ impl Default for QqpdEndpoints {
             pd_origin: static_url("https://pd.qq.com/"),
             qq_login_origin: static_url("https://xui.ptlogin2.qq.com/"),
             explore: static_url("https://pd.qq.com/explore"),
-            guild_page: static_url("https://pd.qq.com/g/"),
+            guild_page: static_url(
+                "https://pd.qq.com/qunng/guild/gotrpc/auth/trpc.group_pro.cmd0x907e.Cmd0x907e/HandleProcess",
+            ),
             search: static_url(
                 "https://pd.qq.com/qunng/guild/gotrpc/auth/trpc.group_pro.in_guild_search_svr.InGuildSearch/NewSearch",
             ),
@@ -68,12 +80,23 @@ pub struct QqpdProfile {
     pub channels: Vec<String>,
     #[serde(default)]
     pub channel_guild_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub dead_channel_failures: BTreeMap<String, u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_keepalive: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for QqpdProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QqpdProfile")
+            .field("active", &self.active)
+            .field("channel_count", &self.channels.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl QqpdProfile {
@@ -84,20 +107,14 @@ impl QqpdProfile {
             qq_masked: qq_masked.into(),
             channels: Vec::new(),
             channel_guild_ids: BTreeMap::new(),
+            dead_channel_failures: BTreeMap::new(),
             login_at: Some(Utc::now()),
             expires_at: None,
             last_keepalive: None,
         }
     }
     pub fn is_ready(&self, now: DateTime<Utc>) -> bool {
-        self.active
-            && !self.cookie.is_empty()
-            && self.expires_at.is_none_or(|v| v > now)
-            && self.channels.iter().all(|channel| {
-                self.channel_guild_ids
-                    .get(channel)
-                    .is_some_and(|guild| valid_guild_id(guild))
-            })
+        self.active && !self.cookie.is_empty() && self.expires_at.is_none_or(|v| v > now)
     }
 
     pub fn needs_keepalive(&self, now: DateTime<Utc>) -> bool {
@@ -112,6 +129,8 @@ pub struct QqpdProvider {
     store: StateStore,
     endpoints: QqpdEndpoints,
     cursor: Arc<AtomicUsize>,
+    writes: Arc<Mutex<()>>,
+    diagnostics: Arc<Mutex<Vec<String>>>,
 }
 
 impl QqpdProvider {
@@ -123,6 +142,8 @@ impl QqpdProvider {
             store,
             endpoints,
             cursor: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::default(),
+            diagnostics: Arc::default(),
         }
     }
     pub fn endpoints(&self) -> &QqpdEndpoints {
@@ -138,7 +159,11 @@ impl QqpdProvider {
         self.store.list_profiles("qqpd").map_err(state_error)
     }
     pub fn load_profile(&self, name: &str) -> Result<Option<QqpdProfile>, ProviderError> {
-        self.store.load("qqpd", name).map_err(state_error)
+        let _lock = self
+            .writes
+            .lock()
+            .map_err(|_| ProviderError::Unavailable("QQPD state lock poisoned".into()))?;
+        self.load_clean(name)
     }
     pub fn save_login(
         &self,
@@ -146,8 +171,12 @@ impl QqpdProvider {
         cookie: impl Into<String>,
         qq_masked: impl Into<String>,
     ) -> Result<(), ProviderError> {
+        let _lock = self
+            .writes
+            .lock()
+            .map_err(|_| ProviderError::Unavailable("QQPD state lock poisoned".into()))?;
         let mut state = self
-            .load_profile(name)?
+            .load_clean(name)?
             .unwrap_or_else(|| QqpdProfile::authenticated("", ""));
         state.cookie = cookie.into();
         state.qq_masked = qq_masked.into();
@@ -157,6 +186,10 @@ impl QqpdProvider {
         self.store.save("qqpd", name, &state).map_err(state_error)
     }
     pub fn logout(&self, name: &str) -> Result<bool, ProviderError> {
+        let _lock = self
+            .writes
+            .lock()
+            .map_err(|_| ProviderError::Unavailable("QQPD state lock poisoned".into()))?;
         self.store.delete("qqpd", name).map_err(state_error)
     }
 
@@ -171,44 +204,26 @@ impl QqpdProvider {
         S: AsRef<str>,
     {
         let additions = normalize_channels(values)?;
-        let mut state = self
-            .load_profile(profile)?
-            .unwrap_or_else(|| QqpdProfile::authenticated("", ""));
-        let mut seen = state.channels.iter().cloned().collect::<HashSet<_>>();
-        state.channels.extend(
-            additions
-                .into_iter()
-                .filter(|channel| seen.insert(channel.clone())),
-        );
-        let channels = state.channels.clone();
-        let existing = state.channel_guild_ids.clone();
-        let base = self.endpoints.guild_page.clone();
-        let resolutions = stream::iter(channels.iter().cloned().map(|channel| {
-            let client = client.clone();
-            let base = base.clone();
-            let cached = existing
-                .get(&channel)
-                .filter(|guild| valid_guild_id(guild))
-                .cloned();
-            async move {
-                if let Some(guild) = cached {
-                    Ok((channel, guild))
-                } else {
-                    let guild = resolve_guild_id(&client, &base, &channel).await?;
-                    Ok::<_, ProviderError>((channel, guild))
+        {
+            let _lock = self
+                .writes
+                .lock()
+                .map_err(|_| ProviderError::Unavailable("QQPD state lock poisoned".into()))?;
+            let mut state = self
+                .load_clean(profile)?
+                .unwrap_or_else(|| QqpdProfile::authenticated("", ""));
+            for channel in additions {
+                state.dead_channel_failures.remove(&channel);
+                if !state.channels.contains(&channel) {
+                    state.channels.push(channel);
                 }
             }
-        }))
-        .buffer_unordered(8)
-        .collect::<Vec<_>>()
-        .await;
-        let resolutions = resolutions.into_iter().collect::<Result<Vec<_>, _>>()?;
-        state.channels = channels.clone();
-        state.channel_guild_ids = resolutions.into_iter().collect();
-        self.store
-            .save("qqpd", profile, &state)
-            .map_err(state_error)?;
-        Ok(channels)
+            self.store
+                .save("qqpd", profile, &state)
+                .map_err(state_error)?;
+        }
+        self.repair_profile(client, profile).await?;
+        self.target_channels(profile)
     }
 
     pub fn delete_channels<I, S>(
@@ -223,8 +238,12 @@ impl QqpdProvider {
         let removals = normalize_channels(values)?
             .into_iter()
             .collect::<HashSet<_>>();
+        let _lock = self
+            .writes
+            .lock()
+            .map_err(|_| ProviderError::Unavailable("QQPD state lock poisoned".into()))?;
         let mut state = self
-            .load_profile(profile)?
+            .load_clean(profile)?
             .unwrap_or_else(|| QqpdProfile::authenticated("", ""));
         state.channels.retain(|channel| !removals.contains(channel));
         state
@@ -256,29 +275,6 @@ impl QqpdProvider {
         }
         Ok(output)
     }
-
-    async fn opportunistic_keepalive(
-        &self,
-        client: &Client,
-        name: &str,
-        profile: &mut QqpdProfile,
-    ) {
-        if !profile.needs_keepalive(Utc::now()) {
-            return;
-        }
-        if let Ok(response) = client
-            .get(self.endpoints.explore.clone())
-            .header(header::COOKIE, &profile.cookie)
-            .header(header::USER_AGENT, USER_AGENT)
-            .send()
-            .await
-            && (response.status().is_success() || response.status().is_redirection())
-        {
-            profile.cookie = merge_set_cookies(&profile.cookie, response.headers());
-            profile.last_keepalive = Some(Utc::now());
-            let _ = self.store.save("qqpd", name, profile);
-        }
-    }
 }
 
 #[async_trait]
@@ -304,21 +300,60 @@ impl Provider for QqpdProvider {
         if profiles.is_empty() {
             return Err(ProviderError::AuthRequired);
         }
-        for (name, profile) in &mut profiles {
-            self.opportunistic_keepalive(&ctx.client, name, profile)
-                .await;
-        }
+        profiles.truncate(10);
         let tasks = assign_channels(&profiles, self.cursor.fetch_add(1, Ordering::Relaxed));
+        if tasks.is_empty() {
+            return Err(ProviderError::Unavailable(
+                "QQPD channels are isolated; re-add channels to restore".into(),
+            ));
+        }
         let client = ctx.client.clone();
         let endpoint = self.endpoints.search.clone();
         let query = query.to_owned();
-        let outcomes = stream::iter(tasks.into_iter().map(|task| {
+        let outcomes = stream::iter(tasks.into_iter().map(|mut task| {
             let client = client.clone();
             let endpoint = endpoint.clone();
             let query = query.clone();
-            async move { search_channel(&client, &endpoint, &task, &query).await }
+            async move {
+                if !valid_guild_id(&task.guild_id) {
+                    let outcome = resolve_guild_id(
+                        &client,
+                        &self.endpoints.guild_page,
+                        &task.channel,
+                        &task.cookie,
+                    )
+                    .await;
+                    let failure = match &outcome {
+                        Ok(_) => None,
+                        Err(ResolveError::Missing) => Some(ProviderError::Protocol(
+                            "QQPD channel explicitly absent (10003)".into(),
+                        )),
+                        Err(ResolveError::Other(e)) => {
+                            Some(ProviderError::Unavailable(e.to_string()))
+                        }
+                    };
+                    if let Ok(ref guild) = outcome {
+                        task.guild_id = guild.clone();
+                    }
+                    self.persist_resolution(
+                        &task.profile_name,
+                        &task.cookie,
+                        task.channel.clone(),
+                        outcome,
+                    )?;
+                    if let Some(error) = failure {
+                        return Err(error);
+                    }
+                }
+                if ctx.is_cancelled() {
+                    return Err(ProviderError::Timeout);
+                }
+                let rows = search_channel(&client, &endpoint, &task, &query).await?;
+                ctx.publish(rows.clone());
+                Ok::<_, ProviderError>(rows)
+            }
         }))
-        .buffered(10)
+        .buffer_unordered(10)
         .collect::<Vec<_>>()
         .await;
         let mut output = Vec::new();
@@ -330,16 +365,19 @@ impl Provider for QqpdProvider {
                 Err(_) => {}
             }
         }
-        if output.is_empty()
-            && let Some(e) = error
-        {
+        let warnings = self.take_diagnostics();
+        if let Some(e) = error {
             return Err(e);
+        }
+        if !warnings.is_empty() {
+            return Err(ProviderError::Unavailable(warnings.join("; ")));
         }
         Ok(output)
     }
 }
 
 struct ChannelTask {
+    profile_name: String,
     channel: String,
     guild_id: String,
     cookie: String,
@@ -360,7 +398,10 @@ fn assign_channels(profiles: &[(String, QqpdProfile)], seed: usize) -> Vec<Chann
             let eligible = profiles
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, p))| p.channels.contains(&channel))
+                .filter(|(_, (_, p))| {
+                    p.channels.contains(&channel)
+                        && p.dead_channel_failures.get(&channel).copied().unwrap_or(0) < 2
+                })
                 .map(|(i, _)| i)
                 .collect::<Vec<_>>();
             let i = eligible.into_iter().min_by_key(|&i| {
@@ -372,11 +413,12 @@ fn assign_channels(profiles: &[(String, QqpdProfile)], seed: usize) -> Vec<Chann
             counts[i] += 1;
             let p = &profiles[i].1;
             Some(ChannelTask {
+                profile_name: profiles[i].0.clone(),
                 guild_id: p
                     .channel_guild_ids
                     .get(&channel)
                     .cloned()
-                    .unwrap_or_else(|| channel.clone()),
+                    .unwrap_or_default(),
                 channel,
                 cookie: p.cookie.clone(),
             })
@@ -386,29 +428,54 @@ fn assign_channels(profiles: &[(String, QqpdProfile)], seed: usize) -> Vec<Chann
 
 async fn resolve_guild_id(
     client: &Client,
-    base: &Url,
+    endpoint: &Url,
     channel: &str,
-) -> Result<String, ProviderError> {
-    if channel.bytes().all(|b| b.is_ascii_digit()) {
+    cookie: &str,
+) -> Result<String, ResolveError> {
+    if valid_guild_id(channel) {
         return Ok(channel.into());
     }
-    let url = base
-        .join(channel)
-        .map_err(|e| ProviderError::Protocol(e.to_string()))?;
-    let body = client
-        .get(url)
-        .send()
-        .await
-        .map_err(network)?
-        .error_for_status()
-        .map_err(network)?
-        .text()
-        .await
-        .map_err(network)?;
-    parse_guild_id(&body).ok_or_else(|| {
-        ProviderError::Protocol(format!("QQPD channel {channel} page omitted guild_id"))
-    })
+    if channel.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ResolveError::Other(ProviderError::Protocol(
+            "QQPD invalid numeric guild ID".into(),
+        )));
+    }
+    let root = request_api(client, endpoint, cookie, r#"{"uint32_service_type":1}"#, serde_json::json!({
+        "guild_num":channel,
+        "cmd0xf57_req":{"msg_field_filter":{"msg_guild_info_filter":{"uint32_guild_number":1}},"rpt_req_guild_info_list":[{}]}
+    }), true).await.map_err(ResolveError::Other)?;
+    let result = root
+        .pointer("/data/cmd0xf57_rsp/rpt_rsp_guild_info_list/0/uint32_result")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            ResolveError::Other(ProviderError::Protocol(
+                "QQPD lookup omitted uint32_result".into(),
+            ))
+        })?;
+    if result == 10003 {
+        return Err(ResolveError::Missing);
+    }
+    if result != 0 {
+        return Err(ResolveError::Other(ProviderError::Protocol(format!(
+            "QQPD lookup uint32_result={result}"
+        ))));
+    }
+    let id = root
+        .pointer("/data/cmd0xf57_rsp/rpt_rsp_guild_info_list/0/uint64_guild_id")
+        .map(value_string)
+        .filter(|v| valid_guild_id(v))
+        .ok_or_else(|| {
+            ResolveError::Other(ProviderError::Protocol(
+                "QQPD lookup omitted valid guild ID".into(),
+            ))
+        })?;
+    Ok(id)
 }
+enum ResolveError {
+    Missing,
+    Other(ProviderError),
+}
+
 pub fn parse_guild_id(html: &str) -> Option<String> {
     let marker = "https://groupprohead.gtimg.cn/";
     let rest = &html[html.find(marker)? + marker.len()..];
@@ -416,7 +483,12 @@ pub fn parse_guild_id(html: &str) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 fn valid_guild_id(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(|b| matches!(b, b'1'..=b'9'))
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u64>().is_ok()
 }
 
 async fn search_channel(
@@ -425,27 +497,9 @@ async fn search_channel(
     task: &ChannelTask,
     query: &str,
 ) -> Result<Vec<SearchResult>, ProviderError> {
-    let cookies = parse_cookies(&task.cookie);
-    let p_skey = cookies.get("p_skey").ok_or(ProviderError::AuthRequired)?;
-    let response=client.post(endpoint.clone()).query(&[("bkn",bkn(p_skey).to_string())])
-        .header("x-oidb",r#"{"uint32_command":"0x9287","uint32_service_type":"2"}"#).header(header::CONTENT_TYPE,"application/json")
-        .header(header::USER_AGENT,USER_AGENT).header(header::REFERER,"https://pd.qq.com/").header(header::ORIGIN,"https://pd.qq.com").header(header::COOKIE,&task.cookie)
-        .json(&serde_json::json!({"guild_id":task.guild_id,"query":query,"cookie":"","member_cookie":"","search_type":{"type":0,"feed_type":0},"cond":{"channel_ids":[],"feed_rank_type":0,"type_list":[2,3]}}))
-        .send().await.map_err(network)?;
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED
-        || response.status() == reqwest::StatusCode::FORBIDDEN
-    {
-        return Err(ProviderError::AuthRequired);
-    }
-    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(ProviderError::RateLimited);
-    }
-    let body = response
-        .error_for_status()
-        .map_err(network)?
-        .text()
-        .await
-        .map_err(network)?;
+    let root = request_api(client, endpoint, &task.cookie, r#"{"uint32_command":"0x9287","uint32_service_type":"2"}"#,
+        serde_json::json!({"guild_id":task.guild_id,"query":query,"cookie":"","member_cookie":"","search_type":{"type":0,"feed_type":0},"cond":{"channel_ids":[],"feed_rank_type":0,"type_list":[2,3]}}), false).await?;
+    let body = root.to_string();
     parse_search_response(&body, &task.channel)
 }
 
@@ -453,23 +507,18 @@ pub fn parse_search_response(
     body: &str,
     channel: &str,
 ) -> Result<Vec<SearchResult>, ProviderError> {
-    let root: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| ProviderError::Parse(e.to_string()))?;
-    let feeds = root
-        .pointer("/data/union_result/guild_feeds")
+    let root = validate_api(body)?;
+    let data = root
+        .get("data")
+        .filter(|v| v.is_object())
+        .ok_or_else(|| ProviderError::Protocol("QQPD response omitted data".into()))?;
+    if data.get("union_result").is_some_and(|v| v.is_null()) {
+        return Ok(Vec::new());
+    }
+    let feeds = data
+        .pointer("/union_result/guild_feeds")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            let message = root
-                .get("message")
-                .or_else(|| root.get("msg"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if message.contains("登录") || message.to_ascii_lowercase().contains("login") {
-                ProviderError::AuthRequired
-            } else {
-                ProviderError::Protocol("QQPD response omitted guild_feeds".into())
-            }
-        })?;
+        .ok_or_else(|| ProviderError::Protocol("QQPD response omitted guild_feeds".into()))?;
     Ok(feeds
         .iter()
         .enumerate()
@@ -553,6 +602,13 @@ pub fn normalize_channel(value: &str) -> Result<String, ProviderError> {
     } else {
         value.to_owned()
     };
+    if (candidate.bytes().all(|b| b.is_ascii_digit()) && !valid_guild_id(&candidate))
+        || (candidate.starts_with('-') && candidate[1..].bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(ProviderError::Protocol(
+            "QQPD numeric guild ID must be a positive canonical u64".into(),
+        ));
+    }
     if candidate.is_empty()
         || !candidate
             .bytes()
@@ -597,21 +653,6 @@ fn parse_cookies(value: &str) -> BTreeMap<String, String> {
         .map(|(k, v)| (k.into(), v.into()))
         .collect()
 }
-fn merge_set_cookies(existing: &str, headers: &header::HeaderMap) -> String {
-    let mut values = parse_cookies(existing);
-    for raw in headers.get_all(header::SET_COOKIE) {
-        if let Ok(raw) = raw.to_str()
-            && let Some((k, v)) = raw.split(';').next().and_then(|v| v.split_once('='))
-        {
-            values.insert(k.trim().into(), v.trim().into());
-        }
-    }
-    values
-        .into_iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
 fn value_i64(value: &serde_json::Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_str()?.parse().ok())
 }
@@ -622,8 +663,12 @@ fn value_string(value: &serde_json::Value) -> String {
         .or_else(|| value.as_u64().map(|v| v.to_string()))
         .unwrap_or_default()
 }
-fn network(error: reqwest::Error) -> ProviderError {
-    ProviderError::Network(error.to_string())
+fn network(error: impl Into<anyhow::Error>) -> ProviderError {
+    let error = error.into();
+    match error.downcast::<reqwest::Error>() {
+        Ok(error) => ProviderError::Network(error.without_url().to_string()),
+        Err(error) => ProviderError::Network(error.to_string()),
+    }
 }
 fn state_error(error: crate::state::StateError) -> ProviderError {
     ProviderError::Unavailable(error.to_string())
@@ -698,7 +743,13 @@ mod tests {
             cookie: cookie.into(),
             qq_masked: String::new(),
             channels: vec!["one".into(), "two".into(), "three".into()],
-            channel_guild_ids: BTreeMap::new(),
+            channel_guild_ids: [
+                ("one".into(), "1".into()),
+                ("two".into(), "2".into()),
+                ("three".into(), "3".into()),
+            ]
+            .into(),
+            dead_channel_failures: BTreeMap::new(),
             login_at: None,
             expires_at: None,
             last_keepalive: Some(Utc::now() - chrono::Duration::seconds(181)),
@@ -757,7 +808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_guild_resolution_does_not_overwrite_profile() {
+    async fn failed_guild_resolution_preserves_channels_and_warns() {
         let tmp = tempfile::tempdir().unwrap();
         let endpoints = QqpdEndpoints {
             guild_page: Url::parse("http://127.0.0.1:1/g/").unwrap(),
@@ -774,10 +825,12 @@ mod tests {
             provider
                 .add_channels(&Client::new(), "main", ["named-channel"])
                 .await
-                .is_err()
+                .is_ok()
         );
         let state = provider.load_profile("main").unwrap().unwrap();
-        assert_eq!(state.channels, ["12345"]);
+        assert_eq!(state.channels, ["12345", "named-channel"]);
+        assert!(!state.channel_guild_ids.contains_key("named-channel"));
+        assert!(!provider.take_diagnostics().is_empty());
         assert_eq!(
             state.channel_guild_ids.get("12345").map(String::as_str),
             Some("12345")

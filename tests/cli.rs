@@ -163,15 +163,19 @@ fn gying_login_help_explains_ready_state_and_saved_credentials() {
 }
 
 #[test]
-fn panlian_login_help_explains_ready_state_and_optional_filter() {
+fn panlian_login_help_explains_manual_challenges_and_optional_filter() {
     let error =
         Cli::try_parse_from(["pansou", "provider", "login", "panlian", "--help"]).unwrap_err();
     let help = error.to_string();
-    assert!(help.contains("ready to search immediately after login"));
-    assert!(help.contains("filtering is optional and global across profiles"));
+    assert!(help.contains("graphic captcha"));
+    assert!(help.contains("bound email (not a mail OTP)"));
+    assert!(help.contains("--interactive"));
+    assert!(help.contains("Optional global cloud filtering"));
     assert!(help.contains("provider configure panlian --blocked-cloud"));
-    assert!(help.contains("--remember-credentials requires PANSOU_STATE_KEY"));
-    assert!(help.contains("automatic login retry"));
+    assert!(help.contains("Expired sessions require manual login"));
+    assert!(help.contains("passwords are never saved"));
+    assert!(!help.contains("--remember-credentials"));
+    assert!(!help.contains("automatic login retry"));
 }
 
 #[test]

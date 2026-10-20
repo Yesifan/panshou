@@ -230,8 +230,8 @@ fn help_reports_configured_budget_without_writing_and_survives_bad_config() {
     let output = fixture.run(&["help"]);
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Providers: 15"));
-    assert!(text.contains("~540s"));
+    assert!(text.contains("Providers: 62"));
+    assert!(text.contains("~600s"));
     assert!(text.contains("longer queries may reduce search quality"));
     assert_eq!(fs::read_to_string(fixture.channels()).unwrap(), content);
     assert!(!fixture.channels().with_extension("lock").exists());

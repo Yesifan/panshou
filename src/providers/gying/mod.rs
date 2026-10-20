@@ -7,12 +7,14 @@ pub use challenge::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::{StreamExt, stream};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     sync::{Arc, LazyLock, RwLock},
     time::Duration,
+    time::Instant,
 };
 use url::Url;
 
@@ -71,6 +73,7 @@ struct RuntimeProfile {
     name: String,
     data: GyingProfile,
     session: Session,
+    warmed_at: Arc<RwLock<Option<Instant>>>,
 }
 impl std::fmt::Debug for RuntimeProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -111,6 +114,7 @@ impl GyingProvider {
                     name,
                     data,
                     session,
+                    warmed_at: Arc::default(),
                 })
             }
         }
@@ -183,9 +187,10 @@ impl GyingProvider {
             return Err(ProviderError::AuthRequired);
         }
         let warm = self.endpoints.base.join("mv/wkMn").map_err(protocol)?;
-        let _ = self
+        let warmed = self
             .request_challenged(&session, reqwest::Method::GET, warm, None)
-            .await;
+            .await
+            .is_ok();
         let cookie = session
             .cookie_header(&self.endpoints.base)
             .unwrap_or_default();
@@ -210,6 +215,7 @@ impl GyingProvider {
             name: profile.into(),
             data: data.clone(),
             session,
+            warmed_at: Arc::new(RwLock::new(warmed.then(Instant::now))),
         });
         Ok(data)
     }
@@ -232,9 +238,9 @@ impl GyingProvider {
             if let Some(form) = form {
                 request = request.form(form)
             }
-            let response = request.send().await.map_err(network)?;
+            let response = crate::http::execute(request).await.map_err(network)?;
             let status = response.status();
-            let body = response.bytes().await.map_err(network)?.to_vec();
+            let body = read_body(response).await?;
             if !is_challenge(&body) {
                 if status == reqwest::StatusCode::FORBIDDEN {
                     return Err(ProviderError::AuthRequired);
@@ -262,26 +268,33 @@ impl GyingProvider {
         if let Some(raw) = capture_json(&text) {
             let challenge: Challenge = serde_json::from_str(raw).map_err(parse)?;
             let solution = if !challenge.modulus.is_empty() {
-                solve_inline_pow(&challenge, Duration::from_secs(3))
+                solve_inline_pow(&challenge, Duration::ZERO)
                     .await
                     .map_err(challenge_error)?
             } else {
-                solve_legacy(&challenge).map_err(challenge_error)?
+                challenge::solve_legacy_cooperative(&challenge)
+                    .await
+                    .map_err(challenge_error)?
             };
             return submit_solution(session, &self.endpoints.base, request_url, solution).await;
         }
         let pow_url = self.endpoints.base.join("res/pow").map_err(protocol)?;
-        let response = gying_headers(
+        let response = crate::http::execute(gying_headers(
             session.client().get(pow_url.clone()),
             &self.endpoints.base,
             Some(request_url.as_str()),
             false,
-        )
-        .send()
+        ))
         .await
         .map_err(network)?;
-        let challenge: Challenge = response.json().await.map_err(network)?;
-        let solution = solve_remote_pow(&challenge).map_err(challenge_error)?;
+        let challenge: Challenge =
+            serde_json::from_slice(&read_body(response).await?).map_err(parse)?;
+        let solution = Solution::Pow {
+            id: None,
+            y: challenge::solve_pow_cooperative(&challenge)
+                .await
+                .map_err(challenge_error)?,
+        };
         submit_solution(session, &self.endpoints.base, &pow_url, solution).await
     }
 
@@ -291,13 +304,24 @@ impl GyingProvider {
         ctx: &SearchContext,
         query: &str,
     ) -> Result<Vec<SearchResult>, ProviderError> {
+        let needs_warmup = profile
+            .warmed_at
+            .read()
+            .unwrap()
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(600));
+        if needs_warmup {
+            let warm = self.endpoints.base.join("mv/wkMn").map_err(protocol)?;
+            self.request_challenged(&profile.session, reqwest::Method::GET, warm, None)
+                .await?;
+            *profile.warmed_at.write().unwrap() = Some(Instant::now());
+        }
         let mut url = self.endpoints.base.join("search").map_err(protocol)?;
         url.query_pairs_mut()
             .append_pair("q", query)
             .append_pair("type", "0")
             .append_pair("mode", "2");
         let body = tokio::time::timeout(
-            ctx.timeout,
+            ctx.remaining(),
             self.request_challenged(&profile.session, reqwest::Method::GET, url, None),
         )
         .await
@@ -313,53 +337,88 @@ impl GyingProvider {
             .ok_or_else(|| ProviderError::Parse("gying search payload missing".into()))?
             .as_str();
         let search: SearchData = serde_json::from_str(raw).map_err(parse)?;
+        let count = search
+            .l
+            .i
+            .len()
+            .min(search.l.title.len())
+            .min(search.l.d.len());
+        let mut details = stream::iter(0..count)
+            .map(|index| self.fetch_detail(profile, ctx, query, &search, index))
+            .buffer_unordered(50);
         let mut output = Vec::new();
-        for index in 0..search.l.i.len() {
-            let title = search.l.title.get(index).cloned().unwrap_or_default();
-            if !title.to_lowercase().contains(&query.to_lowercase()) {
-                continue;
+        while let Some(row) = details.next().await {
+            if let Some(row) = row? {
+                ctx.publish(vec![row.clone()]);
+                output.push(row);
             }
-            let kind = search.l.d.get(index).map(String::as_str).unwrap_or("mv");
-            let id = &search.l.i[index];
-            let detail_url = self
-                .endpoints
-                .base
-                .join(&format!("res/downurl/{kind}/{id}"))
-                .map_err(protocol)?;
-            let body = self
-                .request_challenged(&profile.session, reqwest::Method::GET, detail_url, None)
-                .await?;
-            let detail: DetailData = serde_json::from_slice(&body).map_err(parse)?;
-            if detail.code == 403 {
-                return Err(ProviderError::AuthRequired);
-            }
-            let mut links = extract_links(&detail, &title);
-            if links.is_empty() {
-                continue;
-            }
-            let year = search.l.year.get(index).copied().unwrap_or_default();
-            let display = if year > 0 {
-                format!("{title}（{year}）")
-            } else {
-                title
-            };
-            for link in &mut links {
-                if link.work_title.is_none() {
-                    link.work_title = Some(display.clone())
-                }
-            }
-            output.push(SearchResult {
-                id: format!("gying-{kind}-{id}"),
-                source: Source::provider("gying"),
-                datetime: Some(Utc::now()),
-                title: display,
-                content: search.l.info.get(index).cloned().unwrap_or_default(),
-                links,
-                tags: (year > 0).then(|| year.to_string()).into_iter().collect(),
-                images: vec![],
-            })
         }
         Ok(output)
+    }
+
+    async fn fetch_detail(
+        &self,
+        profile: &RuntimeProfile,
+        ctx: &SearchContext,
+        query: &str,
+        search: &SearchData,
+        index: usize,
+    ) -> Result<Option<SearchResult>, ProviderError> {
+        if ctx.is_cancelled() {
+            return Err(ProviderError::Timeout);
+        }
+        let title = search.l.title[index].clone();
+        if !title.to_lowercase().contains(&query.to_lowercase()) {
+            return Ok(None);
+        }
+        let kind = search.l.d[index].as_str();
+        let id = &search.l.i[index];
+        if kind.trim().is_empty() || id.trim().is_empty() || title.trim().is_empty() {
+            return Ok(None);
+        }
+        let detail_url = self
+            .endpoints
+            .base
+            .join(&format!("res/downurl/{kind}/{id}"))
+            .map_err(protocol)?;
+        let body = self
+            .request_challenged(&profile.session, reqwest::Method::GET, detail_url, None)
+            .await?;
+        let detail: DetailData = serde_json::from_slice(&body).map_err(parse)?;
+        if detail.code == 403 {
+            return Err(ProviderError::AuthRequired);
+        }
+        if detail.code != 200 {
+            return Err(ProviderError::Protocol(
+                "gying detail request failed".into(),
+            ));
+        }
+        let mut links = extract_links(&detail, &title);
+        if links.is_empty() {
+            return Ok(None);
+        }
+        let year = search.l.year.get(index).copied().unwrap_or_default();
+        let display = if year > 0 {
+            format!("{title}（{year}）")
+        } else {
+            title
+        };
+        for link in &mut links {
+            if link.work_title.is_none() {
+                link.work_title = Some(display.clone())
+            }
+        }
+        let row = SearchResult {
+            id: format!("gying-{kind}-{id}"),
+            source: Source::provider("gying"),
+            datetime: Some(Utc::now()),
+            title: display,
+            content: search.l.info.get(index).cloned().unwrap_or_default(),
+            links,
+            tags: (year > 0).then(|| year.to_string()).into_iter().collect(),
+            images: vec![],
+        };
+        Ok(Some(row))
     }
 }
 
@@ -390,9 +449,16 @@ impl Provider for GyingProvider {
         let mut all = Vec::new();
         let mut seen = HashSet::new();
         let mut last = None;
+        let mut completed_profiles = 0;
+        let mut relogged = false;
         for profile in profiles {
             let first = self.search_profile(&profile, ctx, query).await;
-            let result = if matches!(&first, Err(ProviderError::AuthRequired)) {
+            let result = if matches!(&first, Err(ProviderError::AuthRequired))
+                && !ctx.has_results()
+                && !relogged
+                && ctx.remaining() >= Duration::from_secs(4)
+            {
+                relogged = true;
                 if let Some(password) = profile.data.password.as_deref() {
                     match self
                         .login(&profile.name, &profile.data.username, password, true)
@@ -425,6 +491,7 @@ impl Provider for GyingProvider {
             };
             match result {
                 Ok(rows) => {
+                    completed_profiles += 1;
                     for row in rows {
                         if seen.insert(row.id.clone()) {
                             all.push(row)
@@ -434,7 +501,7 @@ impl Provider for GyingProvider {
                 Err(e) => last = Some(e),
             }
         }
-        if all.is_empty()
+        if completed_profiles == 0
             && let Some(error) = last
         {
             return Err(error);
@@ -600,17 +667,19 @@ async fn submit_solution(
             }
         }
     }
-    let response = gying_headers(
-        session.client().post(url.clone()),
-        base,
-        Some(url.as_str()),
-        true,
+    let response = crate::http::execute(
+        gying_headers(
+            session.client().post(url.clone()),
+            base,
+            Some(url.as_str()),
+            true,
+        )
+        .form(&form),
     )
-    .form(&form)
-    .send()
     .await
     .map_err(network)?;
-    let value: serde_json::Value = response.json().await.map_err(network)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&read_body(response).await?).map_err(parse)?;
     if value.get("success").and_then(|v| v.as_bool()) == Some(true) {
         Ok(())
     } else {
@@ -647,8 +716,13 @@ fn restore_cookie(session: &Session, origin: &Url, cookie: &str) {
         session.add_cookie(&format!("{pair}; Path=/"), origin)
     }
 }
-fn network(e: reqwest::Error) -> ProviderError {
-    ProviderError::Network(e.to_string())
+async fn read_body(response: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
+    crate::http::read_response(response, 16 * 1024 * 1024)
+        .await
+        .map_err(|_| ProviderError::Network("Gying response read failed or exceeded limit".into()))
+}
+fn network(_: impl std::fmt::Display) -> ProviderError {
+    ProviderError::Network("Gying HTTP request failed".into())
 }
 fn parse(e: serde_json::Error) -> ProviderError {
     ProviderError::Parse(e.to_string())
@@ -666,6 +740,125 @@ fn challenge_error(e: ChallengeError) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn mock_provider(base: &str, store: StateStore) -> GyingProvider {
+        store
+            .save(
+                "gying",
+                "fixture",
+                &GyingProfile {
+                    username: "fixture".into(),
+                    password: None,
+                    cookie: "session=fixture".into(),
+                    status: active(),
+                },
+            )
+            .unwrap();
+        GyingProvider::load(
+            store,
+            Endpoints::parse(base).unwrap(),
+            HttpClientFactory::new(),
+            ClientOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn aligned_arrays_skip_missing_type_and_warm_once() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        Mock::given(path("/mv/wkMn"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ready"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"_obj.search = {"l":{"title":["Movie","Movie two"],"d":[],"i":["a","b"]}};"#,
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let provider = mock_provider(&server.uri(), StateStore::with_cipher(temp.path(), None));
+        let ctx = SearchContext::new(reqwest::Client::new(), Duration::from_secs(5));
+        assert!(provider.search(&ctx, "Movie").await.unwrap().is_empty());
+        assert!(provider.search(&ctx, "Movie").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_detail_is_retained_when_another_returns_403() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        Mock::given(path("/mv/wkMn"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(path("/search")).respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"_obj.search = {"l":{"title":["Movie","Movie two"],"d":["mv","tv"],"i":["a","b"]}};"#
+        )).mount(&server).await;
+        Mock::given(path("/res/downurl/mv/a"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"code":200,"panlist":{"url":["https://pan.quark.cn/s/fast"]}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(path("/res/downurl/tv/b"))
+            .respond_with(ResponseTemplate::new(403).set_delay(Duration::from_millis(50)))
+            .mount(&server)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let provider = mock_provider(&server.uri(), StateStore::with_cipher(temp.path(), None));
+        let ctx = SearchContext::new(reqwest::Client::new(), Duration::from_secs(5));
+        assert!(matches!(
+            provider.search(&ctx, "Movie").await,
+            Err(ProviderError::AuthRequired)
+        ));
+        assert_eq!(ctx.finish(Vec::new()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legal_empty_account_outweighs_another_account_failure() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(path("/mv/wkMn"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(path("/search"))
+            .and(header("cookie", "session=fixture"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"_obj.search = {"l":{"title":[],"d":[],"i":[]}};"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/search"))
+            .and(header("cookie", "session=broken"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::with_cipher(temp.path(), None);
+        store
+            .save(
+                "gying",
+                "broken",
+                &GyingProfile {
+                    username: "broken".into(),
+                    password: None,
+                    cookie: "session=broken".into(),
+                    status: active(),
+                },
+            )
+            .unwrap();
+        let provider = mock_provider(&server.uri(), store);
+        let ctx = SearchContext::new(reqwest::Client::new(), Duration::from_secs(5));
+        assert!(provider.search(&ctx, "Movie").await.unwrap().is_empty());
+    }
+
     #[test]
     fn extracts_fixture_links() {
         let detail:DetailData=serde_json::from_str(r#"{"code":200,"panlist":{"name":["全集"],"p":["a1b2"],"url":["https://pan.quark.cn/s/abc"],"time":[]},"downlist":{"list":{"m":["0123456789abcdef0123456789abcdef01234567"],"t":["资源"]}}}"#).unwrap();

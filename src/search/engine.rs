@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -73,6 +73,17 @@ pub struct SearchSummary {
     pub duration_ms: u128,
 }
 
+impl SearchSummary {
+    pub fn exit_code(&self) -> i32 {
+        match self.finish_reason {
+            FinishReason::Deadline => 124,
+            FinishReason::Interrupted => 130,
+            FinishReason::Completed if self.sources_completed == 0 => 3,
+            FinishReason::Completed => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SearchEvent {
@@ -123,6 +134,18 @@ pub struct SearchEngine {
     telegram: TelegramSource,
 }
 
+/// Timeout futures cannot preempt a synchronous poll that returns after its deadline.
+fn reject_late_source_result<T>(
+    deadline: tokio::time::Instant,
+    result: Result<T, ProviderError>,
+) -> Result<T, ProviderError> {
+    if tokio::time::Instant::now() >= deadline {
+        Err(ProviderError::Timeout)
+    } else {
+        result
+    }
+}
+
 impl SearchEngine {
     pub fn new(context: SearchContext) -> Self {
         Self {
@@ -161,6 +184,8 @@ impl SearchEngine {
         let started = Instant::now();
         let deadline = tokio::time::sleep(options.all_timeout);
         tokio::pin!(deadline);
+        let overall_deadline = tokio::time::Instant::now() + options.all_timeout;
+        let collectors = Arc::new(Mutex::new(HashMap::<usize, SearchContext>::new()));
         let priorities: HashMap<String, i32> = options
             .providers
             .iter()
@@ -180,14 +205,28 @@ impl SearchEngine {
             let query = options.query.clone();
             let timeout = options.timeout;
             let sources_started = sources_started.clone();
+            let collectors = collectors.clone();
             queue.push_back(
                 async move {
                     sources_started.fetch_add(1, Ordering::Relaxed);
+                    let ctx = ctx
+                        .for_source((tokio::time::Instant::now() + timeout).min(overall_deadline));
+                    collectors.lock().unwrap().insert(index, ctx.clone());
                     let source = format!("provider:{}", provider.meta().name);
-                    let result = tokio::time::timeout(timeout, provider.search(&ctx, &query))
-                        .await
-                        .map_err(|_| ProviderError::Timeout)
-                        .and_then(|value| value);
+                    let source_deadline = ctx.deadline().unwrap();
+                    let result = tokio::time::timeout_at(
+                        source_deadline,
+                        std::panic::AssertUnwindSafe(provider.search(&ctx, &query)).catch_unwind(),
+                    )
+                    .await
+                    .map_err(|_| ProviderError::Timeout)
+                    .and_then(|value| {
+                        value.map_err(|_| ProviderError::Unavailable("provider panicked".into()))
+                    })
+                    .and_then(|value| value);
+                    // A synchronous parser can finish in the same poll after
+                    // its timer elapsed; never accept that late final batch.
+                    let result = reject_late_source_result(source_deadline, result);
                     (index, source, result)
                 }
                 .boxed(),
@@ -203,10 +242,22 @@ impl SearchEngine {
             queue.push_back(
                 async move {
                     sources_started.fetch_add(1, Ordering::Relaxed);
-                    let result = tokio::time::timeout(timeout, telegram.search(&channel, &query))
-                        .await
-                        .map_err(|_| ProviderError::Timeout)
-                        .and_then(|value| value);
+                    let source_deadline =
+                        (tokio::time::Instant::now() + timeout).min(overall_deadline);
+                    let result = tokio::time::timeout_at(
+                        source_deadline,
+                        std::panic::AssertUnwindSafe(telegram.search(&channel, &query))
+                            .catch_unwind(),
+                    )
+                    .await
+                    .map_err(|_| ProviderError::Timeout)
+                    .and_then(|value| {
+                        value.map_err(|_| {
+                            ProviderError::Unavailable("Telegram source panicked".into())
+                        })
+                    })
+                    .and_then(|value| value);
+                    let result = reject_late_source_result(source_deadline, result);
                     (index, format!("tg:{channel}"), result)
                 }
                 .boxed(),
@@ -255,56 +306,85 @@ impl SearchEngine {
                     reason = FinishReason::Interrupted;
                     break;
                 }
+                _ = async {
+                    match &sender {
+                        Some(sender) => sender.closed().await,
+                        None => futures::future::pending::<()>().await,
+                    }
+                } => {
+                    reason = FinishReason::Interrupted;
+                    break;
+                }
                 value = tasks.next() => value,
             };
+            // select! cannot preempt a long synchronous poll. Recheck the
+            // command-wide terminal conditions before accepting its outcome.
+            if *cancellation.borrow() || sender.as_ref().is_some_and(|s| s.is_closed()) {
+                reason = FinishReason::Interrupted;
+                break;
+            }
+            if tokio::time::Instant::now() >= overall_deadline {
+                reason = FinishReason::Deadline;
+                break;
+            }
             let Some((index, source, result)) = finished else {
                 break;
             };
+            let batch = match &result {
+                Ok(batch) => batch.clone(),
+                Err(_) => Vec::new(),
+            };
+            let batch = collectors
+                .lock()
+                .unwrap()
+                .remove(&index)
+                .map_or(batch.clone(), |ctx| ctx.finish(batch));
             match result {
-                Ok(mut batch) => {
-                    successful_sources += 1;
-                    apply_query_filter(&mut batch, &options.query, &modes);
-                    batch = filter_results(
-                        batch,
-                        &FilterOptions {
-                            include: options.include.clone(),
-                            exclude: options.exclude.clone(),
-                            cloud_types: options.clouds.iter().copied().collect(),
-                        },
-                    );
-                    rank_results(&mut batch, Utc::now(), &priorities);
-                    batches.push((index, batch));
-                    // Preserve source completion order for stream presentation.
-                    let rows = merge_search_results(batches.iter().map(|(_, batch)| batch.clone()));
-                    for mut link in merge_links(&rows, None, &options.clouds) {
-                        let id = crate::core::canonical_url_key(&link.url);
-                        // A newer duplicate must not erase an already known password.
-                        if let Some(previous) = emitted.get(&id) {
-                            if link.password.is_none() {
-                                link.password = previous.password.clone();
-                            }
-                            if previous == &link {
-                                continue;
-                            }
-                            emit(SearchEvent::ResultUpdate {
-                                id: id.clone(),
-                                link: link.clone(),
-                            });
-                        } else {
-                            emit(SearchEvent::Result {
-                                id: id.clone(),
-                                link: link.clone(),
-                            });
-                        }
-                        emitted.insert(id, link);
-                    }
-                }
+                Ok(_) => successful_sources += 1,
                 Err(error) => {
                     let error = source_error(source, error);
                     emit(SearchEvent::SourceError {
                         error: error.clone(),
                     });
                     errors.push((index, error));
+                }
+            }
+            {
+                let mut batch = batch;
+                apply_query_filter(&mut batch, &options.query, &modes);
+                batch = filter_results(
+                    batch,
+                    &FilterOptions {
+                        include: options.include.clone(),
+                        exclude: options.exclude.clone(),
+                        cloud_types: options.clouds.iter().copied().collect(),
+                    },
+                );
+                rank_results(&mut batch, Utc::now(), &priorities);
+                batches.push((index, batch));
+                // Preserve source completion order for stream presentation.
+                let rows = merge_search_results(batches.iter().map(|(_, batch)| batch.clone()));
+                for mut link in merge_links(&rows, None, &options.clouds) {
+                    let id = crate::core::canonical_url_key(&link.url);
+                    // A newer duplicate must not erase an already known password.
+                    if let Some(previous) = emitted.get(&id) {
+                        if link.password.is_none() {
+                            link.password = previous.password.clone();
+                        }
+                        if previous == &link {
+                            continue;
+                        }
+                        emit(SearchEvent::ResultUpdate {
+                            id: id.clone(),
+                            link: link.clone(),
+                        });
+                    } else {
+                        emit(SearchEvent::Result {
+                            id: id.clone(),
+                            link: link.clone(),
+                        });
+                    }
+                    emitted.insert(id, link);
                 }
             }
             emit(SearchEvent::Progress {
@@ -316,8 +396,51 @@ impl SearchEngine {
         let sources_started = sources_started.load(Ordering::Relaxed);
         let cancelled = sources_started - successful_sources - errors.len();
         let not_started = selected - sources_started;
+        // Seal before dropping futures: retained clones cannot alter the snapshot.
+        let mut snapshots: Vec<_> = collectors.lock().unwrap().drain().collect();
+        snapshots.sort_by_key(|(index, _)| *index);
+        for (index, ctx) in snapshots {
+            let mut batch = ctx.finish(Vec::new());
+            apply_query_filter(&mut batch, &options.query, &modes);
+            batch = filter_results(
+                batch,
+                &FilterOptions {
+                    include: options.include.clone(),
+                    exclude: options.exclude.clone(),
+                    cloud_types: options.clouds.iter().copied().collect(),
+                },
+            );
+            rank_results(&mut batch, Utc::now(), &priorities);
+            batches.push((index, batch));
+        }
         drop(tasks);
         drop(queue);
+        batches.sort_by_key(|(index, _)| *index);
+        let rows = merge_search_results(batches.iter().map(|(_, batch)| batch.clone()));
+        for mut link in merge_links(&rows, None, &options.clouds) {
+            let id = crate::core::canonical_url_key(&link.url);
+            if let Some(previous) = emitted.get(&id) {
+                if link.password.is_none() {
+                    link.password = previous.password.clone();
+                }
+                if previous == &link {
+                    continue;
+                }
+            }
+            let event = if emitted.contains_key(&id) {
+                SearchEvent::ResultUpdate {
+                    id: id.clone(),
+                    link: link.clone(),
+                }
+            } else {
+                SearchEvent::Result {
+                    id: id.clone(),
+                    link: link.clone(),
+                }
+            };
+            emit(event);
+            emitted.insert(id, link);
+        }
         let elapsed = started.elapsed().as_millis();
         let summary = SearchSummary {
             total_links: emitted.len(),
@@ -479,6 +602,134 @@ mod tests {
         }
     }
 
+    struct PanickingProvider;
+    #[async_trait]
+    impl Provider for PanickingProvider {
+        fn meta(&self) -> ProviderMeta {
+            ProviderMeta::stateless("panic", 2, KeywordFilterMode::Core)
+        }
+        async fn search(
+            &self,
+            ctx: &SearchContext,
+            _: &str,
+        ) -> Result<Vec<SearchResult>, ProviderError> {
+            ctx.publish(vec![result(
+                "panic",
+                "movie early",
+                "https://pan.quark.cn/s/early",
+            )]);
+            panic!("fixture provider panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_panic_preserves_its_snapshot_without_aborting_other_sources() {
+        let engine = SearchEngine::new(SearchContext::new(
+            reqwest::Client::new(),
+            Duration::from_secs(1),
+        ));
+        let outcome = engine
+            .search(SearchOptions {
+                query: "movie".into(),
+                providers: vec![
+                    Arc::new(PanickingProvider),
+                    Arc::new(FakeProvider {
+                        name: "other",
+                        mode: KeywordFilterMode::Core,
+                        result: Ok(vec![result(
+                            "other",
+                            "movie complete",
+                            "https://pan.quark.cn/s/other",
+                        )]),
+                    }),
+                ],
+                ..SearchOptions::default()
+            })
+            .await;
+        assert_eq!(outcome.successful_sources, 1);
+        assert_eq!(outcome.total_links, 2);
+        assert_eq!(outcome.source_errors.len(), 1);
+        assert_eq!(
+            outcome.source_errors[0].message,
+            "provider is unavailable: provider panicked"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_deadline_check_rejects_a_synchronously_ready_late_batch() {
+        // Tokio polls the inner future first, even with an already elapsed timer.
+        // Model a parser's ready response arriving after the absolute deadline
+        // without wall-clock sleeps or scheduler races.
+        let deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+        let result = tokio::time::timeout_at(
+            deadline,
+            std::future::ready(Ok(vec![result(
+                "late",
+                "movie late",
+                "https://pan.quark.cn/s/late",
+            )])),
+        )
+        .await
+        .expect("a synchronously ready future wins timeout_at's first poll");
+        assert!(matches!(
+            reject_late_source_result(deadline, result),
+            Err(ProviderError::Timeout)
+        ));
+        assert!(
+            reject_late_source_result(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Ok::<_, ProviderError>(Vec::<SearchResult>::new()),
+            )
+            .is_ok()
+        );
+    }
+
+    struct BlockingParser;
+    #[async_trait]
+    impl Provider for BlockingParser {
+        fn meta(&self) -> ProviderMeta {
+            ProviderMeta::stateless("blocking", 2, KeywordFilterMode::Core)
+        }
+        async fn search(
+            &self,
+            ctx: &SearchContext,
+            _: &str,
+        ) -> Result<Vec<SearchResult>, ProviderError> {
+            ctx.publish(vec![result(
+                "blocking",
+                "movie early",
+                "https://pan.quark.cn/s/early",
+            )]);
+            // Simulate one parser poll that cannot be preempted by timeout_at.
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(vec![result(
+                "late",
+                "movie late",
+                "https://pan.quark.cn/s/late",
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_synchronous_final_batch_cannot_bypass_the_source_deadline() {
+        let engine = SearchEngine::new(SearchContext::new(
+            reqwest::Client::new(),
+            Duration::from_secs(1),
+        ));
+        let outcome = engine
+            .search(SearchOptions {
+                query: "movie".into(),
+                providers: vec![Arc::new(BlockingParser)],
+                timeout: Duration::from_millis(5),
+                ..SearchOptions::default()
+            })
+            .await;
+        assert_eq!(outcome.successful_sources, 0);
+        assert_eq!(outcome.source_errors[0].kind, "timeout");
+        assert_eq!(outcome.total_links, 1);
+        assert!(outcome.results[0].links[0].url.ends_with("/early"));
+    }
+
     #[tokio::test]
     async fn failures_are_fail_soft_and_core_query_filter_applies() {
         let client = reqwest::Client::new();
@@ -572,6 +823,84 @@ mod tests {
         }
     }
 
+    struct DisconnectPendingProvider {
+        active: Arc<AtomicUsize>,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for DisconnectPendingProvider {
+        fn meta(&self) -> ProviderMeta {
+            ProviderMeta::stateless("disconnect-pending", 2, KeywordFilterMode::Provider)
+        }
+        async fn search(
+            &self,
+            ctx: &SearchContext,
+            _: &str,
+        ) -> Result<Vec<SearchResult>, ProviderError> {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            let _guard = ActiveGuard(self.active.clone());
+            ctx.publish(vec![result(
+                "early",
+                "movie early",
+                "https://pan.quark.cn/s/early",
+            )]);
+            self.ready.notify_one();
+            futures::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consumer_disconnect_drops_pending_provider_and_keeps_interrupted_accounting() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let (_cancel, cancellation) = watch::channel(false);
+        let engine = test_engine();
+        let search = engine.search_stream(
+            SearchOptions {
+                query: "movie".into(),
+                providers: vec![
+                    Arc::new(DisconnectPendingProvider {
+                        active: active.clone(),
+                        ready: ready.clone(),
+                    }),
+                    Arc::new(FakeProvider {
+                        name: "queued",
+                        mode: KeywordFilterMode::Core,
+                        result: Ok(vec![]),
+                    }),
+                ],
+                jobs: 1,
+                timeout: Duration::from_secs(3600),
+                all_timeout: Duration::from_secs(3600),
+                ..Default::default()
+            },
+            sender,
+            cancellation,
+        );
+        tokio::pin!(search);
+        tokio::select! {
+            _ = &mut search => panic!("pending provider must not finish before disconnect"),
+            _ = ready.notified() => {},
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        drop(receiver);
+        let (outcome, summary) = tokio::time::timeout(Duration::from_millis(1), search)
+            .await
+            .expect("consumer disconnect must wake the search without waiting for a source");
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(summary.finish_reason, FinishReason::Interrupted);
+        assert_eq!(summary.exit_code(), 130);
+        assert_eq!(summary.sources_selected, 2);
+        assert_eq!(summary.sources_completed, 0);
+        assert_eq!(summary.sources_failed, 0);
+        assert_eq!(summary.sources_cancelled, 1);
+        assert_eq!(summary.sources_not_started, 1);
+        assert_eq!(outcome.total_links, 1);
+        assert!(outcome.results[0].links[0].url.ends_with("/early"));
+    }
+
     #[derive(Debug)]
     struct TimedProvider {
         name: &'static str,
@@ -616,6 +945,263 @@ mod tests {
             reqwest::Client::new(),
             Duration::from_secs(30),
         ))
+    }
+
+    #[derive(Debug)]
+    struct IncrementalProvider {
+        delay: Duration,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Provider for IncrementalProvider {
+        fn meta(&self) -> ProviderMeta {
+            ProviderMeta::stateless("incremental", 2, KeywordFilterMode::Provider)
+        }
+        async fn search(
+            &self,
+            ctx: &SearchContext,
+            _: &str,
+        ) -> Result<Vec<SearchResult>, ProviderError> {
+            assert!(ctx.deadline().is_some());
+            let row = result("incremental", "Movie", "https://pan.quark.cn/s/fast");
+            assert!(ctx.publish(vec![row.clone()]));
+            tokio::time::sleep(self.delay).await;
+            if self.fail {
+                return Err(ProviderError::Network("later request failed".into()));
+            }
+            let mut row = row;
+            row.links.push(Link::new("https://pan.quark.cn/s/second"));
+            row.links[0].password = Some("abcd".into());
+            Ok(vec![row])
+        }
+    }
+
+    async fn incremental_search(
+        timeout: u64,
+        all_timeout: u64,
+        delay: u64,
+        fail: bool,
+    ) -> (SearchOutcome, SearchSummary) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_cancel, cancelled) = watch::channel(false);
+        test_engine()
+            .search_stream(
+                SearchOptions {
+                    providers: vec![Arc::new(IncrementalProvider {
+                        delay: Duration::from_secs(delay),
+                        fail,
+                    })],
+                    timeout: Duration::from_secs(timeout),
+                    all_timeout: Duration::from_secs(all_timeout),
+                    ..Default::default()
+                },
+                tx,
+                cancelled,
+            )
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incremental_deadline_preserves_snapshot_without_success() {
+        let (outcome, summary) = incremental_search(100, 5, 100, false).await;
+        assert_eq!(outcome.total_links, 1);
+        assert_eq!(summary.sources_completed, 0);
+        assert_eq!(summary.sources_failed, 0);
+        assert_eq!(summary.sources_cancelled, 1);
+        assert_eq!(summary.sources_not_started, 0);
+        assert_eq!(summary.exit_code(), 124);
+        assert!(summary.partial);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_incremental_source_keeps_links_and_exit_130() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (cancel, cancelled) = watch::channel(false);
+        let interrupt = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            cancel.send(true).unwrap();
+        });
+        let (outcome, summary) = test_engine()
+            .search_stream(
+                SearchOptions {
+                    providers: vec![Arc::new(IncrementalProvider {
+                        delay: Duration::from_secs(100),
+                        fail: false,
+                    })],
+                    ..Default::default()
+                },
+                tx,
+                cancelled,
+            )
+            .await;
+        interrupt.await.unwrap();
+        assert_eq!(outcome.total_links, 1);
+        assert_eq!(summary.sources_cancelled, 1);
+        assert_eq!(summary.sources_failed, 0);
+        assert_eq!(summary.exit_code(), 130);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_empty_source_is_success_even_when_another_fails() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_cancel, cancelled) = watch::channel(false);
+        let (_, summary) = test_engine()
+            .search_stream(
+                SearchOptions {
+                    providers: vec![
+                        Arc::new(FakeProvider {
+                            name: "empty",
+                            mode: KeywordFilterMode::Core,
+                            result: Ok(vec![]),
+                        }),
+                        Arc::new(FakeProvider {
+                            name: "broken",
+                            mode: KeywordFilterMode::Core,
+                            result: Err(ProviderError::Blocked),
+                        }),
+                    ],
+                    ..Default::default()
+                },
+                tx,
+                cancelled,
+            )
+            .await;
+        assert_eq!(summary.sources_completed, 1);
+        assert_eq!(summary.sources_failed, 1);
+        assert_eq!(summary.total_links, 0);
+        assert_eq!(summary.exit_code(), 0);
+        assert!(summary.partial);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_timeout_and_error_are_failures_even_with_links() {
+        for (timeout, delay, fail, kind) in [(2, 100, false, "timeout"), (30, 1, true, "network")] {
+            let (outcome, summary) = incremental_search(timeout, 600, delay, fail).await;
+            assert_eq!(outcome.total_links, 1);
+            assert_eq!(outcome.source_errors[0].kind, kind);
+            assert_eq!(summary.sources_completed, 0);
+            assert_eq!(summary.sources_failed, 1);
+            assert_eq!(summary.sources_cancelled, 0);
+            assert_eq!(summary.exit_code(), 3);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn normal_return_unions_incremental_rows_and_enriches_passwords() {
+        let (outcome, summary) = incremental_search(30, 600, 1, false).await;
+        assert_eq!(outcome.total_results, 1);
+        assert_eq!(outcome.total_links, 2);
+        assert_eq!(
+            outcome.results[0].links[0].password.as_deref(),
+            Some("abcd")
+        );
+        assert_eq!(summary.sources_completed, 1);
+        assert_eq!(summary.exit_code(), 0);
+        assert!(!summary.partial);
+    }
+
+    #[derive(Debug)]
+    struct CancelledIncremental(&'static str);
+    #[async_trait]
+    impl Provider for CancelledIncremental {
+        fn meta(&self) -> ProviderMeta {
+            ProviderMeta::stateless(self.0, 2, KeywordFilterMode::Provider)
+        }
+        async fn search(
+            &self,
+            ctx: &SearchContext,
+            _: &str,
+        ) -> Result<Vec<SearchResult>, ProviderError> {
+            ctx.publish(vec![result(
+                self.0,
+                self.0,
+                &format!("https://pan.quark.cn/s/{}", self.0),
+            )]);
+            futures::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_snapshots_are_emitted_in_selected_source_order() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_cancel, cancelled) = watch::channel(false);
+        let (_, summary) = test_engine()
+            .search_stream(
+                SearchOptions {
+                    providers: vec![
+                        Arc::new(CancelledIncremental("first")),
+                        Arc::new(CancelledIncremental("second")),
+                    ],
+                    all_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+                tx,
+                cancelled,
+            )
+            .await;
+        let SearchEvent::Result { link: first, .. } = rx.recv().await.unwrap() else {
+            panic!("first snapshot result");
+        };
+        let SearchEvent::Result { link: second, .. } = rx.recv().await.unwrap() else {
+            panic!("second snapshot result");
+        };
+        assert!(first.url.ends_with("/first"));
+        assert!(second.url.ends_with("/second"));
+        assert_eq!(summary.sources_cancelled, 2);
+        assert_eq!(
+            summary.sources_completed
+                + summary.sources_failed
+                + summary.sources_cancelled
+                + summary.sources_not_started,
+            summary.sources_selected
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_metadata_enrichment_precedes_query_filtering() {
+        let ctx = SearchContext::new(reqwest::Client::new(), Duration::from_secs(30));
+        let mut early = result("incremental", "placeholder", "https://pan.quark.cn/s/fast");
+        early.links[0].work_title = Some("placeholder".into());
+        early.links[0].password = Some("abcd".into());
+        ctx.publish(vec![early.clone()]);
+        let mut final_row = early;
+        final_row.title = "Movie title".into();
+        final_row.content = "enriched content".into();
+        final_row.tags = vec!["tag".into()];
+        final_row.images = vec!["image".into()];
+        final_row.links[0].password = None;
+        final_row.links[0].work_title = Some("Movie episode".into());
+        let mut rows = ctx.finish(vec![final_row]);
+        apply_query_filter(&mut rows, "Movie", &HashMap::new());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Movie title");
+        assert_eq!(rows[0].content, "enriched content");
+        assert_eq!(rows[0].tags, ["tag"]);
+        assert_eq!(rows[0].images, ["image"]);
+        assert_eq!(rows[0].links[0].password.as_deref(), Some("abcd"));
+        assert_eq!(
+            rows[0].links[0].work_title.as_deref(),
+            Some("Movie episode")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frozen_collector_rejects_late_writes_and_deadline_is_not_reset() {
+        let base = SearchContext::new(reqwest::Client::new(), Duration::from_secs(30));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let ctx = base.for_source(deadline);
+        let clone = ctx.clone();
+        let row = result("incremental", "Movie", "https://pan.quark.cn/s/fast");
+        assert!(ctx.publish(vec![row.clone()]));
+        let snapshot = ctx.finish(Vec::new());
+        assert!(!clone.publish(vec![row.clone()]));
+        assert_eq!(clone.finish(Vec::new()).len(), snapshot.len());
+        let fresh = base.for_source(deadline);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(!fresh.publish(vec![row]));
+        assert_eq!(fresh.remaining(), Duration::ZERO);
+        assert_eq!(fresh.deadline(), Some(deadline));
     }
 
     #[tokio::test(start_paused = true)]

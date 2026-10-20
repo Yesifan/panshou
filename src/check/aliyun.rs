@@ -1,5 +1,6 @@
 use super::engine::CheckEvaluation;
 use super::normalize::last_path_segment;
+use super::protocol::{BoundedRequest, BoundedResponse};
 use super::protocol::{contains_any, json, number, string};
 use super::{CheckCloudType, CheckContext, CheckError, CheckItem, CheckState, LinkChecker};
 use async_trait::async_trait;
@@ -35,10 +36,10 @@ impl LinkChecker for AliyunChecker {
             .header("referer", "https://www.alipan.com/")
             .header("x-canary", "client=web,app=share,version=v2.3.1")
             .json(&serde_json::json!({"share_id":id}))
-            .send()
+            .gated_send()
             .await?;
         let status = response.status();
-        let body = response.bytes().await?;
+        let body = response.bounded_bytes().await?;
         let value = json(&body)?;
         let code = string(&value, &["code"]);
         let message = string(&value, &["message"]);

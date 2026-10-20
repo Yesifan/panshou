@@ -146,6 +146,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn corrupt_entry_is_reported_and_engine_continues_checking() {
+        use crate::check::{
+            CheckContext, CheckEngine, CheckError, CheckEvaluation, CheckItem, CheckOptions,
+            LinkChecker,
+        };
+        struct Fake;
+        #[async_trait::async_trait]
+        impl LinkChecker for Fake {
+            fn cloud_type(&self) -> CheckCloudType {
+                CheckCloudType::Quark
+            }
+            async fn check_normalized(
+                &self,
+                _: &CheckContext,
+                _: &CheckItem,
+                _: &str,
+            ) -> Result<CheckEvaluation, CheckError> {
+                Ok(CheckEvaluation::new(CheckState::Ok, "network fallback"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CheckCache::open(dir.path().join("check.redb")).unwrap();
+        let key = "quark|https://pan.quark.cn/s/a";
+        let write = cache.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(RESULTS).unwrap();
+            table.insert(key, b"{broken".as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+        assert!(matches!(cache.get(key), Err(CacheError::Serialization(_))));
+        let engine = CheckEngine::with_checkers(
+            reqwest::Client::new(),
+            Some(cache.clone()),
+            vec![Arc::new(Fake)],
+        );
+        let results = engine
+            .check(
+                vec![CheckItem::detect("https://pan.quark.cn/s/a")],
+                CheckOptions::default(),
+            )
+            .await;
+        assert_eq!(results[0].state, CheckState::Ok);
+        assert!(!results[0].cache_hit);
+        assert!(cache.get(key).unwrap().is_some());
+    }
+
     #[test]
     fn persists_and_prunes_entries() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,4 +1,5 @@
 use super::engine::CheckEvaluation;
+use super::protocol::{BoundedRequest, BoundedResponse};
 use super::protocol::{json, number, string};
 use super::{CheckCloudType, CheckContext, CheckError, CheckItem, CheckState, LinkChecker};
 use async_trait::async_trait;
@@ -55,9 +56,9 @@ impl LinkChecker for BaiduChecker {
                     .query(&[("surl", short.as_str()), ("pwd", pwd.as_str())])
                     .header("referer", n)
                     .form(&[("pwd", pwd.as_str()), ("vcode", ""), ("vcode_str", "")])
-                    .send()
+                    .gated_send()
                     .await?
-                    .bytes()
+                    .bounded_bytes()
                     .await?,
             )?;
             match number(&v, &["errno"]) {
@@ -91,7 +92,7 @@ impl LinkChecker for BaiduChecker {
         if let Some(c) = bdclnd {
             req = req.header("cookie", format!("BDCLND={c}"));
         }
-        let v = json(&req.send().await?.bytes().await?)?;
+        let v = json(&req.gated_send().await?.bounded_bytes().await?)?;
         Ok(match number(&v, &["errno"]) {
             0 if v
                 .get("list")

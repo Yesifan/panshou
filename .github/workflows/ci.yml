@@ -41,19 +41,45 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux
+          - name: Linux x86_64 musl
             os: ubuntu-latest
-          - name: macOS
-            os: macos-latest
-          - name: Windows
+            target: x86_64-unknown-linux-musl
+            builder: cross
+          - name: Linux aarch64 musl
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            builder: cross
+          - name: macOS x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            builder: cargo
+          - name: macOS aarch64
+            os: macos-15
+            target: aarch64-apple-darwin
+            builder: cargo
+          - name: Windows x86_64
             os: windows-latest
+            target: x86_64-pc-windows-msvc
+            builder: cargo
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Build release binary
-        run: cargo build --release --locked --all-features
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@cross
+      - name: Build release binary with cross
+        if: matrix.builder == 'cross'
+        run: cross build --release --locked --all-features --target ${{ matrix.target }}
+      - name: Build release binary with Cargo
+        if: matrix.builder == 'cargo'
+        run: cargo build --release --locked --all-features --target ${{ matrix.target }}
       - name: Verify platform updater and migrations
+        if: matrix.builder == 'cargo'
         run: |
-          cargo test --locked --lib update::
-          cargo test --locked --lib migration::
+          cargo test --locked --lib --target ${{ matrix.target }} update::
+          cargo test --locked --lib --target ${{ matrix.target }} migration::

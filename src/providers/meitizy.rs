@@ -133,8 +133,7 @@ impl Provider for MeitizyProvider {
         ctx: &SearchContext,
         query: &str,
     ) -> Result<Vec<SearchResult>, ProviderError> {
-        let response = tokio::time::timeout(
-            ctx.timeout,
+        let text = crate::providers::b_registry::http::text(
             ctx.client
                 .post(self.endpoints.search.clone())
                 .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -150,25 +149,14 @@ impl Provider for MeitizyProvider {
                     title: query,
                     page: 1,
                     size: 10,
-                })
-                .send(),
+                }),
+            3,
+            200,
+            true,
+            ctx.timeout,
+            16 << 20,
         )
-        .await
-        .map_err(|_| ProviderError::Timeout)?
-        .map_err(|e| ProviderError::Network(e.to_string()))?;
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(ProviderError::RateLimited);
-        }
-        if !response.status().is_success() {
-            return Err(ProviderError::Protocol(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
-        let text = response
-            .text()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        .await?;
         parse_response(&text)
     }
 }

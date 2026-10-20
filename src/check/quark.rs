@@ -1,4 +1,5 @@
 use super::engine::CheckEvaluation;
+use super::protocol::{BoundedRequest, BoundedResponse};
 use super::protocol::{contains_any, json, number, string};
 use super::{CheckCloudType, CheckContext, CheckError, CheckItem, CheckState, LinkChecker};
 use async_trait::async_trait;
@@ -41,7 +42,7 @@ impl LinkChecker for QuarkChecker {
                     .map(|(_, v)| v.into_owned())
             })
             .unwrap_or_default();
-        let v=json(&ctx.client.post(&self.token).header("origin","https://pan.quark.cn").header("referer","https://pan.quark.cn/").json(&serde_json::json!({"pwd_id":id,"passcode":pwd,"support_visit_limit_private_share":true})).send().await?.bytes().await?)?;
+        let v=json(&ctx.client.post(&self.token).header("origin","https://pan.quark.cn").header("referer","https://pan.quark.cn/").json(&serde_json::json!({"pwd_id":id,"passcode":pwd,"support_visit_limit_private_share":true})).gated_send().await?.bounded_bytes().await?)?;
         let code = number(&v, &["code"]);
         let msg = string(&v, &["message"]);
         if code != 0 {
@@ -72,9 +73,9 @@ impl LinkChecker for QuarkChecker {
                 ])
                 .header("origin", "https://pan.quark.cn")
                 .header("referer", "https://pan.quark.cn/")
-                .send()
+                .gated_send()
                 .await?
-                .bytes()
+                .bounded_bytes()
                 .await?,
         )?;
         let code = number(&v, &["code"]);

@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -230,28 +231,38 @@ impl Provider for WeiboProvider {
         let endpoints = self.endpoints.clone();
         let client = ctx.client.clone();
         let query = query.to_owned();
-        let outcomes =
-            stream::iter(tasks.into_iter().map(|task| {
-                let endpoints = endpoints.clone();
-                let client = client.clone();
-                let query = query.clone();
-                async move {
-                    search_user(&client, &endpoints, &task.user_id, &task.cookie, &query).await
-                }
-            }))
-            .buffered(10)
-            .collect::<Vec<_>>()
-            .await;
+        let mut outcomes = stream::iter(tasks.into_iter().map(|task| {
+            let endpoints = endpoints.clone();
+            let client = client.clone();
+            let query = query.clone();
+            async move {
+                search_user(
+                    ctx,
+                    &client,
+                    &endpoints,
+                    &task.user_id,
+                    &task.cookie,
+                    &query,
+                )
+                .await
+            }
+        }))
+        .buffer_unordered(10);
         let mut results = Vec::new();
         let mut first_error = None;
-        for outcome in outcomes {
+        let mut successful_users = 0;
+        while let Some(outcome) = outcomes.next().await {
             match outcome {
-                Ok(mut values) => results.append(&mut values),
+                Ok(mut values) => {
+                    successful_users += 1;
+                    ctx.publish(values.clone());
+                    results.append(&mut values);
+                }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
         }
-        if results.is_empty()
+        if successful_users == 0
             && let Some(error) = first_error
         {
             return Err(error);
@@ -301,6 +312,7 @@ fn assign_users(profiles: &[(String, WeiboProfile)], seed: usize) -> Vec<UserTas
 }
 
 async fn search_user(
+    ctx: &SearchContext,
     client: &Client,
     endpoints: &WeiboEndpoints,
     uid: &str,
@@ -309,21 +321,23 @@ async fn search_user(
 ) -> Result<Vec<SearchResult>, ProviderError> {
     let mut output = Vec::new();
     for page in 1..=3 {
-        let response = client
-            .get(endpoints.search.clone())
-            .query(&[
-                ("uid", uid),
-                ("feature", "0"),
-                ("q", query),
-                ("page", &page.to_string()),
-            ])
-            .header(header::USER_AGENT, USER_AGENT)
-            .header(header::REFERER, endpoints.web_origin.as_str())
-            .header(header::ACCEPT, "application/json, text/plain, */*")
-            .header(header::COOKIE, cookie)
-            .send()
-            .await
-            .map_err(network)?;
+        let response = crate::http::execute(
+            client
+                .get(endpoints.search.clone())
+                .timeout(ctx.request_timeout(Duration::from_secs(15)))
+                .query(&[
+                    ("uid", uid),
+                    ("feature", "0"),
+                    ("q", query),
+                    ("page", &page.to_string()),
+                ])
+                .header(header::USER_AGENT, USER_AGENT)
+                .header(header::REFERER, endpoints.web_origin.as_str())
+                .header(header::ACCEPT, "application/json, text/plain, */*")
+                .header(header::COOKIE, cookie),
+        )
+        .await
+        .map_err(network)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             || response.status() == reqwest::StatusCode::FORBIDDEN
         {
@@ -332,31 +346,26 @@ async fn search_user(
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(ProviderError::RateLimited);
         }
-        let body = response
-            .error_for_status()
-            .map_err(network)?
-            .text()
-            .await
-            .map_err(network)?;
+        let body = read_text(response.error_for_status().map_err(network)?).await?;
         let posts = parse_search_page(&body, uid)?;
         if posts.is_empty() {
             break;
         }
         for mut post in posts {
             for url in &post.external_urls {
-                if let Ok(found) = fetch_external_links(client, url).await {
+                if let Ok(found) = fetch_external_links(ctx, client, url).await {
                     merge_unique_links(&mut post.result.links, found);
                 }
             }
             if post.result.links.is_empty() {
-                let comments = fetch_comments(client, endpoints, &post.weibo_id, cookie)
+                let comments = fetch_comments(ctx, client, endpoints, &post.weibo_id, cookie)
                     .await
                     .unwrap_or_default();
                 for comment in comments {
                     let direct = extract_links(&comment);
                     if direct.is_empty() {
                         for url in http_urls(&comment) {
-                            if let Ok(found) = fetch_external_links(client, &url).await {
+                            if let Ok(found) = fetch_external_links(ctx, client, &url).await {
                                 merge_unique_links(&mut post.result.links, found);
                             }
                         }
@@ -467,22 +476,26 @@ fn parse_post(post: &serde_json::Value, uid: &str) -> Result<ParsedPost, Provide
     })
 }
 
-async fn fetch_external_links(client: &Client, value: &str) -> Result<Vec<Link>, ProviderError> {
+async fn fetch_external_links(
+    ctx: &SearchContext,
+    client: &Client,
+    value: &str,
+) -> Result<Vec<Link>, ProviderError> {
     let url = Url::parse(value).map_err(|e| ProviderError::Protocol(e.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Ok(Vec::new());
     }
-    let body = client
-        .get(url)
-        .header(header::USER_AGENT, USER_AGENT)
-        .send()
-        .await
-        .map_err(network)?
-        .error_for_status()
-        .map_err(network)?
-        .text()
-        .await
-        .map_err(network)?;
+    let response = crate::http::execute(
+        client
+            .get(url)
+            .timeout(ctx.request_timeout(Duration::from_secs(15)))
+            .header(header::USER_AGENT, USER_AGENT),
+    )
+    .await
+    .map_err(network)?
+    .error_for_status()
+    .map_err(network)?;
+    let body = read_text(response).await?;
     Ok(extract_links(&body))
 }
 
@@ -498,28 +511,40 @@ fn http_urls(value: &str) -> Vec<String> {
 }
 
 async fn fetch_comments(
+    ctx: &SearchContext,
     client: &Client,
     endpoints: &WeiboEndpoints,
     id: &str,
     cookie: &str,
 ) -> Result<Vec<String>, ProviderError> {
-    let response = client
-        .get(endpoints.comments.clone())
-        .query(&[
-            ("id", id),
-            ("mid", id),
-            ("max_id", "0"),
-            ("max_id_type", "0"),
-        ])
-        .header(header::USER_AGENT, USER_AGENT)
-        .header(header::REFERER, endpoints.mobile_origin.as_str())
-        .header(header::COOKIE, cookie)
-        .send()
+    let response = crate::http::execute(
+        client
+            .get(endpoints.comments.clone())
+            .timeout(ctx.request_timeout(Duration::from_secs(30)))
+            .query(&[
+                ("id", id),
+                ("mid", id),
+                ("max_id", "0"),
+                ("max_id_type", "0"),
+            ])
+            .header(header::USER_AGENT, USER_AGENT)
+            .header(header::REFERER, endpoints.mobile_origin.as_str())
+            .header(header::COOKIE, cookie),
+    )
+    .await
+    .map_err(network)?
+    .error_for_status()
+    .map_err(network)?;
+    parse_comments(&read_text(response).await?)
+}
+
+pub(super) async fn read_text(response: reqwest::Response) -> Result<String, ProviderError> {
+    let body = crate::http::read_response(response, 16 * 1024 * 1024)
         .await
-        .map_err(network)?
-        .error_for_status()
-        .map_err(network)?;
-    parse_comments(&response.text().await.map_err(network)?)
+        .map_err(|_| {
+            ProviderError::Network("Weibo response read failed or exceeded limit".into())
+        })?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 pub fn parse_comments(body: &str) -> Result<Vec<String>, ProviderError> {
@@ -657,8 +682,8 @@ fn dedupe_results(results: &mut Vec<SearchResult>) {
     results.retain(|result| seen.insert(result.id.clone()));
 }
 
-fn network(error: reqwest::Error) -> ProviderError {
-    ProviderError::Network(error.to_string())
+fn network(_: impl std::fmt::Display) -> ProviderError {
+    ProviderError::Network("Weibo HTTP request failed".into())
 }
 fn state_error(error: crate::state::StateError) -> ProviderError {
     ProviderError::Unavailable(error.to_string())
@@ -737,6 +762,52 @@ mod tests {
         assert_eq!(tasks.len(), 3);
         assert_eq!(tasks.iter().filter(|t| t.cookie == "a=1").count(), 2);
         assert_eq!(tasks.iter().filter(|t| t.cookie == "b=1").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_fast_user_survives_slow_first_user_deadline() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{path, query_param},
+        };
+        let server = MockServer::start().await;
+        Mock::given(path("/search"))
+            .and(query_param("uid", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"ok":1,"data":{"list":[]}}"#)
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/search")).and(query_param("uid", "2")).and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":1,"data":{"list":[{"idstr":"post","text_raw":"Movie https://pan.quark.cn/s/fast"}]}}"#))
+            .mount(&server).await;
+        Mock::given(path("/search"))
+            .and(query_param("uid", "2"))
+            .and(query_param("page", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"ok":1,"data":{"list":[]}}"#),
+            )
+            .mount(&server)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let endpoints = WeiboEndpoints {
+            search: Url::parse(&format!("{}/search", server.uri())).unwrap(),
+            ..WeiboEndpoints::default()
+        };
+        let provider =
+            WeiboProvider::with_endpoints(StateStore::with_cipher(temp.path(), None), endpoints);
+        provider.save_login("fixture", "session=fixture").unwrap();
+        provider.add_users("fixture", ["1", "2"]).unwrap();
+        let ctx = SearchContext::new(Client::new(), Duration::from_secs(30))
+            .for_source(tokio::time::Instant::now() + Duration::from_secs(1));
+        let _ =
+            tokio::time::timeout_at(ctx.deadline().unwrap(), provider.search(&ctx, "Movie")).await;
+        let snapshot = ctx.finish(Vec::new());
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, "weibo-2-post");
+        assert!(!ctx.publish(snapshot.clone()));
     }
 
     #[test]

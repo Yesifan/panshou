@@ -37,7 +37,7 @@ impl Default for ChannelList {
         Self {
             version: 1,
             channels: vec![Channel {
-                name: "tgsearchers3".into(),
+                name: "tgsearchers7".into(),
                 enabled: true,
             }],
         }
@@ -176,15 +176,11 @@ impl ChannelValidator {
                 reason: error.to_string(),
             }
         })?;
-        let response = self
-            .client
-            .get(url)
-            .timeout(self.timeout)
-            .send()
+        let response = crate::http::execute(self.client.get(url).timeout(self.timeout))
             .await
             .map_err(|error| ChannelError::ValidationUncertain {
                 name: name.to_owned(),
-                reason: error.without_url().to_string(),
+                reason: error.to_string(),
             })?;
         let status = response.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
@@ -205,14 +201,13 @@ impl ChannelValidator {
                 reason: format!("unexpected HTTP {status}"),
             });
         }
-        let body = response
-            .text()
+        let body = crate::http::read_response(response, 2 * 1024 * 1024)
             .await
             .map_err(|error| ChannelError::ValidationUncertain {
                 name: name.to_owned(),
-                reason: error.without_url().to_string(),
+                reason: error.to_string(),
             })?;
-        match classify_channel_page(&body, name) {
+        match classify_channel_page(&String::from_utf8_lossy(&body), name) {
             ChannelPageKind::PublicMessages => Ok(()),
             ChannelPageKind::Bot => Err(ChannelError::InvalidSource {
                 name: name.to_owned(),
@@ -497,32 +492,14 @@ impl ChannelStore {
                     "only HTTP(S) URLs are supported".into(),
                 ));
             }
-            let mut response = client
-                .get(url)
-                .timeout(timeout)
-                .send()
+            let response = crate::http::execute(client.get(url).timeout(timeout))
                 .await
-                .map_err(|error| ChannelError::Import(error.without_url().to_string()))?
+                .map_err(|error| ChannelError::Import(error.to_string()))?
                 .error_for_status()
                 .map_err(|error| ChannelError::Import(error.without_url().to_string()))?;
-            if response
-                .content_length()
-                .is_some_and(|n| n > MAX_IMPORT_BYTES as u64)
-            {
-                return Err(ChannelError::Import("list exceeds 1 MiB".into()));
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
+            crate::http::read_response(response, MAX_IMPORT_BYTES)
                 .await
-                .map_err(|error| ChannelError::Import(error.without_url().to_string()))?
-            {
-                if bytes.len() + chunk.len() > MAX_IMPORT_BYTES {
-                    return Err(ChannelError::Import("list exceeds 1 MiB".into()));
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            bytes
+                .map_err(|error| ChannelError::Import(error.to_string()))?
         } else {
             fs::read(source)?
         };
@@ -699,6 +676,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_decodes_bounded_compressed_pages() {
+        let server = MockServer::start().await;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(b"<div class=\"tgme_widget_message\" data-post=\"good/1\"></div>")
+            .unwrap();
+        Mock::given(path("/s/good"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Encoding", "gzip")
+                    .set_body_bytes(encoder.finish().unwrap()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/s/huge"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 2 * 1024 * 1024 + 1]),
+            )
+            .mount(&server)
+            .await;
+        let client = crate::http::HttpClientFactory::new()
+            .client(&crate::http::ClientOptions::default())
+            .unwrap();
+        let validator = ChannelValidator::with_base_url(
+            client,
+            server.uri().parse().unwrap(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            validator.validate(&names(&["good"])).await.unwrap(),
+            ["good"]
+        );
+        let error = validator.validate(&names(&["huge"])).await.unwrap_err();
+        assert!(matches!(error, ChannelError::ValidationUncertain { .. }));
+        assert!(error.to_string().contains("2097152 byte limit"));
+    }
+
+    #[tokio::test]
     async fn validating_a_batch_finishes_before_callers_save_it() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -732,20 +747,46 @@ mod tests {
     fn mutations_preserve_states_and_explicit_empty() {
         let dir = tempfile::tempdir().unwrap();
         let store = ChannelStore::new(dir.path().join("channels.toml"));
-        assert_eq!(store.load().unwrap().enabled_names(), ["tgsearchers3"]);
+        assert_eq!(store.load().unwrap().enabled_names(), ["tgsearchers7"]);
         store.add(&names(&["Foo"]), false).unwrap();
         store.add(&names(&["@foo"]), true).unwrap();
-        assert_eq!(store.load().unwrap().enabled_names(), ["tgsearchers3"]);
+        assert_eq!(store.load().unwrap().enabled_names(), ["tgsearchers7"]);
         store.set_enabled(&names(&["foo"]), true).unwrap();
         assert_eq!(
             store.load().unwrap().enabled_names(),
-            ["tgsearchers3", "foo"]
+            ["tgsearchers7", "foo"]
         );
         let summary = store
-            .remove(&names(&["foo", "tgsearchers3", "missing"]))
+            .remove(&names(&["foo", "tgsearchers7", "missing"]))
             .unwrap();
         assert_eq!(summary.not_found, ["missing"]);
         assert!(store.load().unwrap().channels.is_empty());
+    }
+
+    #[test]
+    fn saved_legacy_default_and_disabled_entries_are_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChannelStore::new(dir.path().join("channels.toml"));
+        let saved = ChannelList {
+            version: 1,
+            channels: vec![
+                Channel {
+                    name: "tgsearchers3".into(),
+                    enabled: true,
+                },
+                Channel {
+                    name: "tgsearchers7".into(),
+                    enabled: false,
+                },
+            ],
+        };
+        fs::write(store.path(), toml::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(store.load().unwrap(), saved);
+        assert_eq!(store.load().unwrap().enabled_names(), ["tgsearchers3"]);
+        assert_eq!(
+            parse_catalog(BUILTIN_CATALOG).unwrap().last().unwrap(),
+            "panzi88com"
+        );
     }
 
     #[test]
@@ -791,7 +832,7 @@ mod tests {
         assert_eq!(summary.added, 2);
         assert_eq!(
             store.load().unwrap().enabled_names(),
-            ["tgsearchers3", "foo", "bar"]
+            ["tgsearchers7", "foo", "bar"]
         );
         assert_eq!(
             store.import_text("foo\nbar\nbaz", false).unwrap().existing,
@@ -800,14 +841,14 @@ mod tests {
         assert_eq!(store.import_text("baz", true).unwrap().existing, 1);
         assert_eq!(
             store.load().unwrap().enabled_names(),
-            ["tgsearchers3", "foo", "bar"]
+            ["tgsearchers7", "foo", "bar"]
         );
         assert!(matches!(
             store.import_text("qux\ninvalid value", true),
             Err(ChannelError::ImportLine { line: 2, .. })
         ));
         assert_eq!(store.load().unwrap().channels.len(), 4);
-        assert_eq!(parse_catalog(BUILTIN_CATALOG).unwrap().len(), 110);
+        assert_eq!(parse_catalog(BUILTIN_CATALOG).unwrap().len(), 111);
     }
 
     #[test]
@@ -912,7 +953,7 @@ mod tests {
         );
         assert_eq!(
             store.load().unwrap().enabled_names(),
-            ["tgsearchers3", "foo", "bar"]
+            ["tgsearchers7", "foo", "bar"]
         );
         let before = fs::read(store.path()).unwrap();
         for endpoint in ["failure", "large"] {
@@ -941,7 +982,7 @@ mod tests {
         );
         assert_eq!(
             store.load().unwrap().enabled_names(),
-            ["tgsearchers3", "foo", "bar"]
+            ["tgsearchers7", "foo", "bar"]
         );
     }
 

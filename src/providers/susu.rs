@@ -1,6 +1,8 @@
 use crate::core::{Link, ProviderError, SearchResult, Source};
 use crate::providers::{KeywordFilterMode, Provider, ProviderMeta, SearchContext};
 use async_trait::async_trait;
+use std::sync::LazyLock;
+static POST_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/([0-9]+)\.html").unwrap());
 use base64::Engine;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::{StreamExt, stream};
@@ -46,7 +48,7 @@ fn posts(body: &str, query: &str) -> Vec<Post> {
     let excerpt = Selector::parse(".post-excerpt").unwrap();
     let time = Selector::parse(".list-footer time.b2timeago").unwrap();
     let tag = Selector::parse(".post-list-cat-item").unwrap();
-    let idre = Regex::new(r"/(\d+)\.html").unwrap();
+
     let words = query
         .to_lowercase()
         .split_whitespace()
@@ -67,7 +69,7 @@ fn posts(body: &str, query: &str) -> Vec<Post> {
                 .or_else(|| {
                     a.value()
                         .attr("href")
-                        .and_then(|x| idre.captures(x))
+                        .and_then(|x| POST_ID_RE.captures(x))
                         .and_then(|c| c.get(1))
                         .map(|m| m.as_str().to_owned())
                 })?;
@@ -173,30 +175,52 @@ fn detail(body: &str) -> Result<Link, ProviderError> {
     });
     Ok(l)
 }
-async fn links(ctx: &SearchContext, base: &Url, id: &str) -> Result<Vec<Link>, ProviderError> {
+fn post_result(post: &Post, links: Vec<Link>) -> SearchResult {
+    SearchResult {
+        id: format!("susu-{}", post.id),
+        source: Source::provider("susu"),
+        datetime: post.datetime,
+        title: post.title.clone(),
+        content: post.content.clone(),
+        links,
+        tags: post.tags.clone(),
+        images: vec![],
+    }
+}
+async fn response_text(response: reqwest::Response) -> Result<String, ProviderError> {
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(ProviderError::Protocol(format!(
+            "susu HTTP {}",
+            response.status()
+        )));
+    }
+    crate::http::response_text(response, None)
+        .await
+        .map_err(|error| ProviderError::Network(error.to_string()))
+}
+async fn links(ctx: &SearchContext, base: &Url, post: &Post) -> Result<Vec<Link>, ProviderError> {
+    let id = post.id.as_str();
     let list = base
         .join("?rest_route=/b2/v1/getDownloadData")
         .map_err(|e| ProviderError::Protocol(e.to_string()))?;
     let origin = base.origin().ascii_serialization();
     let root = base.as_str().trim_end_matches('/');
     let referer = format!("{root}/{id}.html");
-    let body = ctx
-        .client
-        .post(list)
-        .header("user-agent", UA)
-        .header("accept", "application/json, text/plain, */*")
-        .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .header("origin", &origin)
-        .header("referer", &referer)
-        .form(&[("post_id", id), ("guest", "")])
-        .send()
-        .await
-        .map_err(|e| ProviderError::Network(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| ProviderError::Network(e.to_string()))?
-        .text()
-        .await
-        .map_err(|e| ProviderError::Network(e.to_string()))?;
+    let response = crate::http::execute(
+        ctx.client
+            .post(list)
+            .header("user-agent", UA)
+            .header("accept", "application/json, text/plain, */*")
+            .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .header("origin", &origin)
+            .header("referer", &referer)
+            .form(&[("post_id", id), ("guest", "")]),
+    )
+    .await
+    .map_err(super::c_support::network)?
+    .error_for_status()
+    .map_err(super::c_support::network)?;
+    let body = response_text(response).await?;
     let jobs = groups(&body)?;
     let detail_url = base
         .join("?rest_route=/b2/v1/getDownloadPageData")
@@ -204,49 +228,60 @@ async fn links(ctx: &SearchContext, base: &Url, id: &str) -> Result<Vec<Link>, P
     let client = ctx.client.clone();
     let id = id.to_owned();
     let root = root.to_owned();
-    let rows = stream::iter(jobs.into_iter().map(|(index, i)| {
+    let mut rows = stream::iter(jobs.into_iter().map(|(index, i)| {
         let client = client.clone();
         let u = detail_url.clone();
         let id = id.clone();
         let origin = origin.clone();
         let root = root.clone();
         async move {
-            let b = client
-                .post(u)
-                .header("user-agent", UA)
-                .header("accept", "application/json, text/plain, */*")
-                .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-                .header("origin", origin)
-                .header(
-                    "referer",
-                    format!("{root}/download?post_id={id}&index={index}&i={i}"),
-                )
-                .form(&[
-                    ("post_id", id),
-                    ("index", index.to_string()),
-                    ("i", i.to_string()),
-                    ("guest", "".into()),
-                ])
-                .send()
-                .await
-                .ok()?
-                .error_for_status()
-                .ok()?
-                .text()
-                .await
-                .ok()?;
-            detail(&b).ok()
+            let response = crate::http::execute(
+                client
+                    .post(u)
+                    .header("user-agent", UA)
+                    .header("accept", "application/json, text/plain, */*")
+                    .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+                    .header("origin", origin)
+                    .header(
+                        "referer",
+                        format!("{root}/download?post_id={id}&index={index}&i={i}"),
+                    )
+                    .form(&[
+                        ("post_id", id),
+                        ("index", index.to_string()),
+                        ("i", i.to_string()),
+                        ("guest", "".into()),
+                    ]),
+            )
+            .await
+            .map_err(super::c_support::network)?
+            .error_for_status()
+            .map_err(super::c_support::network)?;
+            let body = response_text(response).await?;
+            detail(&body)
         }
     }))
-    .buffered(4)
-    .collect::<Vec<_>>()
-    .await;
+    .buffer_unordered(4);
     let mut seen = std::collections::HashSet::new();
-    Ok(rows
-        .into_iter()
-        .flatten()
-        .filter(|l| seen.insert((l.cloud_type, l.url.clone(), l.password.clone())))
-        .collect())
+    let mut found = Vec::new();
+    let mut first_error = None;
+    while let Some(result) = rows.next().await {
+        match result {
+            Ok(link) => {
+                if seen.insert((link.cloud_type, link.url.clone(), link.password.clone())) {
+                    found.push(link);
+                    ctx.publish(vec![post_result(post, found.clone())]);
+                }
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(found)
 }
 #[async_trait]
 impl Provider for Susu {
@@ -265,51 +300,92 @@ impl Provider for Susu {
         url.query_pairs_mut()
             .append_pair("type", "post")
             .append_pair("s", query);
-        let body = ctx
-            .client
-            .get(url)
-            .header("user-agent", UA)
-            .header(
-                "accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            )
-            .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .header(
-                "referer",
-                format!("{}/", self.endpoints.base.as_str().trim_end_matches('/')),
-            )
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ProviderError::Network(e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let response = crate::http::execute(
+            ctx.client
+                .get(url)
+                .header("user-agent", UA)
+                .header(
+                    "accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                )
+                .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header(
+                    "referer",
+                    format!("{}/", self.endpoints.base.as_str().trim_end_matches('/')),
+                ),
+        )
+        .await
+        .map_err(super::c_support::network)?
+        .error_for_status()
+        .map_err(super::c_support::network)?;
+        let body = response_text(response).await?;
         let base = self.endpoints.base.clone();
         let futures = posts(&body, query).into_iter().map(|post| {
             let base = base.clone();
             async move {
-                let found = links(ctx, &base, &post.id).await.ok()?;
-                (!found.is_empty()).then(|| SearchResult {
-                    id: format!("susu-{}", post.id),
-                    source: Source::provider("susu"),
-                    datetime: post.datetime,
-                    title: post.title,
-                    content: post.content,
-                    links: found,
-                    tags: post.tags,
-                    images: vec![],
-                })
+                let found = links(ctx, &base, &post).await?;
+                Ok::<_, ProviderError>((!found.is_empty()).then(|| post_result(&post, found)))
             }
         });
-        let rows = stream::iter(futures).buffered(4).collect::<Vec<_>>().await;
-        Ok(rows.into_iter().flatten().collect())
+        super::collect_partial(ctx, futures, 4).await
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn nested_download_failure_preserves_status_and_completed_share() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_string, method, query_param},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(include_str!(
+                "../../tests/fixtures/providers/susu/success-post.html"
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("rest_route", "/b2/v1/getDownloadData"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([{"button":[{"name":"夸克"},{"name":"百度"}]}]),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("rest_route", "/b2/v1/getDownloadPageData"))
+            .and(body_string("post_id=12&index=0&i=0&guest="))
+            .respond_with(ResponseTemplate::new(200).set_body_string(include_str!(
+                "../../tests/fixtures/providers/susu/success.json"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("rest_route", "/b2/v1/getDownloadPageData"))
+            .and(body_string("post_id=12&index=0&i=1&guest="))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = Susu::new(Endpoints {
+            base: server.uri().parse().unwrap(),
+        });
+        let client = crate::http::HttpClientFactory::new()
+            .client(&crate::http::ClientOptions::default())
+            .unwrap();
+        let ctx = SearchContext::new(client, std::time::Duration::from_secs(5));
+        let error = provider.search(&ctx, "瑞克").await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error}");
+        let rows = ctx.finish(Vec::new());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].links.len(), 1);
+        assert_eq!(rows[0].links[0].password.as_deref(), Some("abcd"));
+    }
+
     #[test]
     fn fixture_success() {
         let p = posts(
@@ -329,6 +405,19 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(l.password.as_deref(), Some("abcd"));
+    }
+    #[test]
+    fn href_id_fallback_and_item_id_precedence() {
+        let html = r#"<div class="post-list-item"><div class="post-info"><h2><a href="/42.html">test</a></h2></div></div>"#;
+        assert_eq!(posts(html, "test")[0].id, "42");
+        assert_eq!(
+            posts(
+                &html.replace("post-list-item\"", "post-list-item\" id=\"item-99\""),
+                "test"
+            )[0]
+            .id,
+            "99"
+        );
     }
     #[test]
     fn fixture_empty() {

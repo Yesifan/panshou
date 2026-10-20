@@ -9,23 +9,94 @@ use std::{env, fs, path::Path};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const DEFAULT_PROVIDERS: &[&str] = &[
-    "pansearch",
-    "yunsou",
+/// Fixed target deployment defaults, not a live availability assessment.
+pub const UPSTREAM_DEFAULT_PROVIDERS: &[&str] = &[
+    "dyyjpro",
+    "duoduo",
     "djgou",
+    "feikuai",
+    "gaoqing888",
     "hdmoli",
+    "haitunsou",
+    "hunhepan",
+    "ikantv",
+    "jutoushe",
+    "kkv",
+    "dy4k",
+    "libvio",
+    "lingjisp",
+    "lou1",
+    "melost",
     "meitizy",
+    "miosou",
+    "nyaa",
+    "ouge",
+    "panlian",
+    "pansearch",
+    "qqpd",
+    "quark4k",
+    "quarksoo",
+    "quarktv",
+    "sousou",
+    "thepiratebay",
+    "ting77",
+    "wanou",
+    "weibo",
+    "xb6v",
+    "xiaokupan",
+    "xiaozhang",
+    "xiaoyu",
+    "yingso",
     "yulinshufa",
+    "yunso",
+    "yunsou",
+    "zlxapp",
+    "zxzj",
+    "rrbt",
+    "quarkres",
+    "diduan",
+    "huban",
+    "labi",
+    "muou",
+    "shandian",
+    "zhizhen",
     "clxiong",
+    "cyg",
     "jsnoteclub",
     "duanjuw",
     "dyyj",
-    "jupansou",
+    "nsgame",
     "cldi",
     "clmao",
-    "cyg",
     "susu",
+    "u3c3",
+    "5266ys",
+    "dygang",
+    "leso",
+    "btbtlb",
+    "aipan",
+    "sopanya",
+    "hjzhencai",
+    "pan365",
+    "buerchen",
+    "erxiaopan",
+    "488run",
+    "woniu",
 ];
+
+fn default_provider_names() -> Vec<String> {
+    let implemented = crate::providers::builtin_stateless_providers();
+    UPSTREAM_DEFAULT_PROVIDERS
+        .iter()
+        .filter(|name| {
+            matches!(**name, "qqpd" | "weibo" | "panlian" | "woniu")
+                || implemented
+                    .iter()
+                    .any(|provider| provider.meta().name == **name)
+        })
+        .map(|name| (*name).to_owned())
+        .collect()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -36,15 +107,14 @@ pub struct Config {
     pub providers: ProviderConfigs,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
     pub proxy: Option<String>,
     pub timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SearchConfig {
     pub jobs: usize,
     pub all_timeout_secs: u64,
@@ -53,6 +123,47 @@ pub struct SearchConfig {
     #[serde(rename = "channels", skip_serializing)]
     pub deprecated_channels: Option<Vec<String>>,
     pub providers: Vec<String>,
+    /// Keep an absent selection distinct from an explicit list, including [].
+    #[serde(skip)]
+    pub providers_explicit: bool,
+    /// The file's selection, unaffected by temporary CLI/environment overrides.
+    #[serde(skip)]
+    pub saved_providers: Option<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for SearchConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Stored {
+            jobs: usize,
+            all_timeout_secs: u64,
+            channels: Option<Vec<String>>,
+            providers: Option<Vec<String>>,
+        }
+        impl Default for Stored {
+            fn default() -> Self {
+                Self {
+                    jobs: 8,
+                    all_timeout_secs: 600,
+                    channels: None,
+                    providers: None,
+                }
+            }
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        let providers_explicit = stored.providers.is_some();
+        let saved_providers = stored.providers.clone();
+        Ok(Self {
+            jobs: stored.jobs,
+            all_timeout_secs: stored.all_timeout_secs,
+            channels: vec!["tgsearchers7".into()],
+            deprecated_channels: stored.channels,
+            providers: stored.providers.unwrap_or_else(default_provider_names),
+            providers_explicit,
+            saved_providers,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,12 +178,27 @@ pub struct CheckConfig {
 pub struct ProviderConfigs {
     pub gying: GyingConfig,
     pub panlian: PanlianConfig,
+    pub woniu: WoniuConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GyingConfig {
     pub base_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WoniuConfig {
+    pub base_url: String,
+}
+
+impl Default for WoniuConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://wn4k.com".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,7 +209,7 @@ pub struct PanlianConfig {
 
 /// Command-line values. Applying this last establishes the documented CLI
 /// > environment > file > defaults precedence without coupling config to clap.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ConfigOverrides {
     pub proxy: Option<String>,
     pub timeout_secs: Option<u64>,
@@ -92,6 +218,20 @@ pub struct ConfigOverrides {
     pub channels: Option<Vec<String>>,
     pub providers: Option<Vec<String>>,
     pub check_jobs: Option<usize>,
+}
+
+impl std::fmt::Debug for ConfigOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigOverrides")
+            .field("proxy", &self.proxy.as_deref().map(redacted_proxy))
+            .field("timeout_secs", &self.timeout_secs)
+            .field("all_timeout_secs", &self.all_timeout_secs)
+            .field("search_jobs", &self.search_jobs)
+            .field("channels", &self.channels)
+            .field("providers", &self.providers)
+            .field("check_jobs", &self.check_jobs)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -114,6 +254,20 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+impl std::fmt::Debug for NetworkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkConfig")
+            .field("proxy", &self.proxy.as_deref().map(redacted_proxy))
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+pub fn redacted_proxy(value: &str) -> String {
+    crate::http::ProxyUrl::parse(value)
+        .map_or_else(|_| "[invalid proxy]".into(), |url| url.redacted())
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -128,9 +282,11 @@ impl Default for SearchConfig {
         Self {
             jobs: 8,
             all_timeout_secs: 600,
-            channels: vec!["tgsearchers3".into()],
+            channels: vec!["tgsearchers7".into()],
             deprecated_channels: None,
-            providers: DEFAULT_PROVIDERS.iter().map(|v| (*v).to_owned()).collect(),
+            providers: default_provider_names(),
+            providers_explicit: false,
+            saved_providers: None,
         }
     }
 }
@@ -246,6 +402,7 @@ impl Config {
         }
         if let Some(providers) = values.providers {
             self.search.providers = normalized_list(providers);
+            self.search.providers_explicit = true;
         }
         if let Some(jobs) = values.check_jobs {
             self.check.jobs = jobs;
@@ -280,6 +437,7 @@ impl Config {
         }
         if let Some(providers) = env::var_os("ENABLED_PLUGINS").and_then(|v| v.into_string().ok()) {
             self.search.providers = csv(&providers);
+            self.search.providers_explicit = true;
         }
 
         if let Some(value) = parse_env::<u64>("PANSOU_ALL_TIMEOUT_SECS")? {
@@ -293,6 +451,7 @@ impl Config {
         }
         if let Ok(value) = env::var("PANSOU_PROVIDERS") {
             self.search.providers = csv(&value);
+            self.search.providers_explicit = true;
         }
         if let Some(value) = parse_env::<usize>("PANSOU_CHECK_JOBS")? {
             self.check.jobs = value;
@@ -302,7 +461,7 @@ impl Config {
 
     fn apply_network_environment(&mut self) -> Result<(), ConfigError> {
         // Specific proxy compatibility values precede generic ones.
-        if let Some(proxy) = first_env(&["PROXY", "HTTPS_PROXY", "HTTP_PROXY"]) {
+        if let Some(proxy) = crate::http::compatibility_proxy(|name| env::var(name).ok()) {
             self.network.proxy = nonempty(proxy);
         }
         if let Ok(proxy) = env::var("PANSOU_PROXY") {
@@ -326,13 +485,6 @@ where
         .parse()
         .map(Some)
         .map_err(|_| ConfigError::InvalidEnvironment { name, value })
-}
-
-fn first_env(names: &[&str]) -> Option<String> {
-    names
-        .iter()
-        .filter_map(|name| env::var(name).ok())
-        .find(|value| !value.trim().is_empty())
 }
 
 fn nonempty(value: String) -> Option<String> {
@@ -360,12 +512,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn network_debug_does_not_expose_proxy_credentials() {
+        for proxy in [
+            "http://alice:secret@localhost:8080",
+            "http://alice:secret@[",
+        ] {
+            let config = NetworkConfig {
+                proxy: Some(proxy.into()),
+                ..Default::default()
+            };
+            let debug = format!("{config:?}");
+            assert!(!debug.contains("alice"));
+            assert!(!debug.contains("secret"));
+        }
+    }
+
+    #[test]
     fn defaults_match_spec() {
         let config = Config::default();
         assert_eq!(config.network.timeout_secs, 30);
         assert_eq!(config.search.jobs, 8);
         assert_eq!(config.search.all_timeout_secs, 600);
-        assert_eq!(config.search.providers.len(), 15);
+        assert_eq!(config.search.providers, default_provider_names());
+        assert_eq!(UPSTREAM_DEFAULT_PROVIDERS.len(), 71);
+        for explicit_only in ["gying", "jupansou", "kpkuang", "erxiao", "qupanshe"] {
+            assert!(
+                !config
+                    .search
+                    .providers
+                    .iter()
+                    .any(|name| name == explicit_only)
+            );
+        }
     }
 
     #[test]
@@ -375,10 +553,28 @@ mod tests {
             config.search.deprecated_channels,
             Some(vec!["legacy".into()])
         );
-        assert_eq!(config.search.channels, ["tgsearchers3"]);
+        assert_eq!(config.search.channels, ["tgsearchers7"]);
         let serialized = toml::to_string(&config).unwrap();
         assert!(!serialized.contains("channels"));
         assert!(!serialized.contains("legacy"));
+    }
+
+    #[test]
+    fn absent_provider_selection_uses_new_defaults_but_explicit_lists_are_authoritative() {
+        for input in ["", "[search]\njobs = 4\n"] {
+            let config: Config = toml::from_str(input).unwrap();
+            assert_eq!(config.search.providers, default_provider_names());
+        }
+        for names in [vec![], vec!["gying", "jupansou", "kpkuang"]] {
+            let values = names
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let config: Config =
+                toml::from_str(&format!("[search]\nproviders = [{values}]\n")).unwrap();
+            assert_eq!(config.search.providers, names);
+        }
     }
 
     #[test]

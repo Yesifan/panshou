@@ -16,6 +16,13 @@ use crate::{
     state::{StateError, StateStore},
 };
 
+#[cfg(test)]
+mod compatibility_tests;
+mod modern;
+#[cfg(test)]
+mod modern_tests;
+pub use modern::{CaptchaChallenge, EmailConfirmation, LoginOutcome};
+
 const DEFAULT_BASE: &str = "https://pinglian.lol";
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 const JSON_ACCEPT: &str = "application/json, text/plain, */*";
@@ -34,7 +41,7 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PanlianProfile {
     pub username: String,
     #[serde(default)]
@@ -43,6 +50,16 @@ pub struct PanlianProfile {
     pub cookie: String,
     #[serde(default = "active")]
     pub status: String,
+    #[serde(default)]
+    pub last_access: Option<DateTime<Utc>>,
+}
+impl std::fmt::Debug for PanlianProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PanlianProfile")
+            .field("status", &self.status)
+            .field("last_access", &self.last_access)
+            .finish_non_exhaustive()
+    }
 }
 fn active() -> String {
     "active".into()
@@ -98,179 +115,16 @@ impl PanlianProvider {
         Ok(deleted)
     }
 
+    /// Deprecated non-interactive login cannot satisfy the site's graphic captcha.
     pub async fn login(
         &self,
-        session: &Session,
-        profile: &str,
-        username: &str,
-        password: &str,
-        remember_credentials: bool,
+        _session: &Session,
+        _profile: &str,
+        _username: &str,
+        _password: &str,
+        _remember_credentials: bool,
     ) -> Result<PanlianProfile, ProviderError> {
-        if username.trim().is_empty() || password.is_empty() {
-            return Err(ProviderError::Protocol(
-                "username and password are required".into(),
-            ));
-        }
-        let pre = self
-            .endpoints
-            .base
-            .join("api/get_types.php")
-            .map_err(protocol)?;
-        response_ok(
-            panlian_headers(
-                session.client().get(pre),
-                &self.endpoints.base,
-                "",
-                self.endpoints
-                    .base
-                    .join("all-videos.php")
-                    .map_err(protocol)?
-                    .as_str(),
-                false,
-            )
-            .send()
-            .await,
-        )?;
-        let login_url = self
-            .endpoints
-            .base
-            .join("api/login.php")
-            .map_err(protocol)?;
-        let login_referer = self
-            .endpoints
-            .base
-            .join("pages/login.php")
-            .map_err(protocol)?;
-        let response = panlian_headers(
-            session.client().post(login_url),
-            &self.endpoints.base,
-            "",
-            login_referer.as_str(),
-            false,
-        )
-        .form(&[
-            ("username", username.trim()),
-            ("password", password),
-            ("remember", "on"),
-        ])
-        .send()
-        .await
-        .map_err(network)?;
-        let status = response.status();
-        let body = response.text().await.map_err(network)?;
-        if !status.is_success() {
-            return Err(ProviderError::Network(format!("HTTP {status}")));
-        }
-        let login: LoginResponse = serde_json::from_str(&body).map_err(parse)?;
-        if !login.success {
-            return Err(ProviderError::AuthRequired);
-        }
-        let cookie = session
-            .cookie_header(&self.endpoints.base)
-            .unwrap_or_default();
-        if cookie.is_empty() {
-            return Err(ProviderError::Protocol(
-                "login succeeded without a session cookie".into(),
-            ));
-        }
-        let saved = PanlianProfile {
-            username: username.trim().into(),
-            password: remember_credentials.then(|| password.to_owned()),
-            cookie,
-            status: active(),
-        };
-        self.store.save("panlian", profile, &saved).map_err(state)?;
-        let mut profiles = self
-            .profiles
-            .write()
-            .map_err(|_| ProviderError::Unavailable("profile lock poisoned".into()))?;
-        profiles.retain(|(name, _)| name != profile);
-        profiles.push((profile.into(), saved.clone()));
-        Ok(saved)
-    }
-
-    async fn relogin_with_context(
-        &self,
-        ctx: &SearchContext,
-        profile_name: &str,
-        profile: &PanlianProfile,
-        password: &str,
-    ) -> Result<PanlianProfile, ProviderError> {
-        let pre = self
-            .endpoints
-            .base
-            .join("api/get_types.php")
-            .map_err(protocol)?;
-        let pre_referer = self
-            .endpoints
-            .base
-            .join("all-videos.php")
-            .map_err(protocol)?;
-        let pre_response = panlian_headers(
-            ctx.client.get(pre),
-            &self.endpoints.base,
-            "",
-            pre_referer.as_str(),
-            false,
-        )
-        .send()
-        .await
-        .map_err(network)?;
-        if !pre_response.status().is_success() {
-            return Err(ProviderError::Network(format!(
-                "HTTP {}",
-                pre_response.status()
-            )));
-        }
-        let mut cookies = collect_set_cookies(pre_response.headers());
-        let cookie = render_cookies(&cookies);
-        let login_url = self
-            .endpoints
-            .base
-            .join("api/login.php")
-            .map_err(protocol)?;
-        let login_referer = self
-            .endpoints
-            .base
-            .join("pages/login.php")
-            .map_err(protocol)?;
-        let response = panlian_headers(
-            ctx.client.post(login_url),
-            &self.endpoints.base,
-            &cookie,
-            login_referer.as_str(),
-            false,
-        )
-        .form(&[
-            ("username", profile.username.as_str()),
-            ("password", password),
-            ("remember", "on"),
-        ])
-        .send()
-        .await
-        .map_err(network)?;
-        for (name, value) in collect_set_cookies(response.headers()) {
-            cookies.insert(name, value);
-        }
-        let login: LoginResponse = response.json().await.map_err(network)?;
-        if !login.success {
-            return Err(ProviderError::AuthRequired);
-        }
-        let mut saved = profile.clone();
-        saved.cookie = render_cookies(&cookies);
-        if saved.cookie.is_empty() {
-            return Err(ProviderError::AuthRequired);
-        }
-        self.store
-            .save("panlian", profile_name, &saved)
-            .map_err(state)?;
-        let mut profiles = self
-            .profiles
-            .write()
-            .map_err(|_| ProviderError::Unavailable("profile lock poisoned".into()))?;
-        profiles.retain(|(name, _)| name != profile_name);
-        profiles.push((profile_name.into(), saved.clone()));
-        Ok(saved)
+        Err(ProviderError::Protocol("Panlian requires graphic captcha and possibly bound-email confirmation; use login_with_captcha".into()))
     }
 
     async fn search_profile(
@@ -279,6 +133,9 @@ impl PanlianProvider {
         profile: &PanlianProfile,
         query: &str,
     ) -> Result<Vec<SearchResult>, ProviderError> {
+        if let Some(rows) = self.modern_search(ctx, profile, query).await? {
+            return Ok(rows);
+        }
         let mut videos_url = self
             .endpoints
             .base
@@ -378,17 +235,20 @@ impl PanlianProvider {
             .base
             .join("pages/video.php")
             .map_err(protocol)?;
-        if let Ok(response) = panlian_headers(
-            ctx.client.post(api),
-            &self.endpoints.base,
-            cookie,
-            video_referer.as_str(),
-            false,
+        if let Ok(response) = crate::http::execute(
+            panlian_headers(
+                ctx.client.post(api),
+                &self.endpoints.base,
+                cookie,
+                video_referer.as_str(),
+                false,
+            )
+            .json(&serde_json::json!({"token":token}))
+            .timeout(ctx.request_timeout(std::time::Duration::from_secs(20))),
         )
-        .json(&serde_json::json!({"token":token}))
-        .send()
         .await
-            && let Ok(value) = response.json::<ResolveResponse>().await
+            && let Ok(body) = modern::bounded_body(response, 16 * 1024 * 1024).await
+            && let Ok(value) = serde_json::from_slice::<ResolveResponse>(&body)
             && value.success
             && is_real_url(&value.url)
         {
@@ -396,14 +256,16 @@ impl PanlianProvider {
         }
         let mut jump = self.endpoints.base.join("api/go.php").map_err(protocol)?;
         jump.query_pairs_mut().append_pair("t", token);
-        let response = panlian_headers(
-            ctx.client.get(jump),
-            &self.endpoints.base,
-            cookie,
-            video_referer.as_str(),
-            true,
+        let response = crate::http::execute(
+            panlian_headers(
+                ctx.client.get(jump),
+                &self.endpoints.base,
+                cookie,
+                video_referer.as_str(),
+                true,
+            )
+            .timeout(ctx.request_timeout(std::time::Duration::from_secs(20))),
         )
-        .send()
         .await
         .map_err(network)?;
         let final_url = decode_url(response.url().as_str());
@@ -419,7 +281,8 @@ impl PanlianProvider {
         {
             return Ok(location);
         }
-        let body = response.text().await.map_err(network)?;
+        let body = modern::bounded_body(response, 16 * 1024 * 1024).await?;
+        let body = String::from_utf8_lossy(&body);
         extract_jump_url(&body)
             .ok_or_else(|| ProviderError::Parse("panlian token did not resolve".into()))
     }
@@ -452,23 +315,35 @@ impl Provider for PanlianProvider {
         let mut last = None;
         for (name, profile) in profiles {
             let first = self.search_profile(ctx, &profile, query).await;
-            let result = if matches!(&first, Err(ProviderError::AuthRequired)) {
-                if let Some(password) = profile.password.as_deref() {
-                    match self
-                        .relogin_with_context(ctx, &name, &profile, password)
-                        .await
-                    {
-                        Ok(refreshed) => self.search_profile(ctx, &refreshed, query).await,
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    first
-                }
-            } else {
-                first
-            };
+            if matches!(&first, Err(ProviderError::AuthRequired)) {
+                let mut expired = profile.clone();
+                expired.cookie.clear();
+                expired.password = None;
+                expired.status = "expired".into();
+                self.store.save("panlian", &name, &expired).map_err(state)?;
+                self.profiles
+                    .write()
+                    .map_err(|_| ProviderError::Unavailable("profile lock poisoned".into()))?
+                    .retain(|(n, _)| n != &name);
+            }
+            let result = first;
             match result {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    let mut updated = profile.clone();
+                    updated.last_access = Some(Utc::now());
+                    updated.password = None;
+                    self.store.save("panlian", &name, &updated).map_err(state)?;
+                    if let Some((_, saved)) = self
+                        .profiles
+                        .write()
+                        .map_err(|_| ProviderError::Unavailable("profile lock poisoned".into()))?
+                        .iter_mut()
+                        .find(|(n, _)| n == &name)
+                    {
+                        *saved = updated;
+                    }
+                    return Ok(v);
+                }
                 Err(e) => last = Some(e),
             }
         }
@@ -476,6 +351,7 @@ impl Provider for PanlianProvider {
     }
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct LoginResponse {
     success: bool,
@@ -491,6 +367,10 @@ struct VideoResponse {
 #[derive(Deserialize)]
 struct Video {
     vod_id: i64,
+    #[serde(default)]
+    alias: String,
+    #[serde(default)]
+    vod_score: String,
     #[serde(default)]
     vod_name: String,
     #[serde(default)]
@@ -516,6 +396,8 @@ impl Video {
     fn content(&self) -> String {
         [
             self.type_name.as_str(),
+            self.alias.as_str(),
+            self.vod_score.as_str(),
             self.vod_remarks.as_str(),
             self.vod_year.as_str(),
             self.vod_area.as_str(),
@@ -573,19 +455,15 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
     cookie: &str,
     base: &Url,
 ) -> Result<T, ProviderError> {
-    let referer = base.join("all-videos.php").map_err(protocol)?;
-    let r = tokio::time::timeout(
-        ctx.timeout,
-        panlian_headers(ctx.client.get(url), base, cookie, referer.as_str(), false).send(),
+    let value = modern::request_get(
+        &ctx.client,
+        url,
+        cookie,
+        base,
+        ctx.request_timeout(std::time::Duration::from_secs(20)),
     )
-    .await
-    .map_err(|_| ProviderError::Timeout)?
-    .map_err(network)?;
-    if r.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(ProviderError::AuthRequired);
-    }
-    let text = r.text().await.map_err(network)?;
-    serde_json::from_str(&text).map_err(parse)
+    .await?;
+    serde_json::from_value(value).map_err(parse)
 }
 fn panlian_headers(
     request: reqwest::RequestBuilder,
@@ -610,19 +488,12 @@ fn panlian_headers(
         request.header(reqwest::header::COOKIE, cookie)
     }
 }
-fn response_ok(response: Result<reqwest::Response, reqwest::Error>) -> Result<(), ProviderError> {
-    let response = response.map_err(network)?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(ProviderError::Network(format!(
-            "HTTP {}",
-            response.status()
-        )))
+fn network(error: impl Into<anyhow::Error>) -> ProviderError {
+    let error = error.into();
+    match error.downcast::<reqwest::Error>() {
+        Ok(error) => ProviderError::Network(error.without_url().to_string()),
+        Err(error) => ProviderError::Network(error.to_string()),
     }
-}
-fn network(e: reqwest::Error) -> ProviderError {
-    ProviderError::Network(e.to_string())
 }
 fn parse(e: serde_json::Error) -> ProviderError {
     ProviderError::Parse(e.to_string())
@@ -635,26 +506,6 @@ fn state(e: StateError) -> ProviderError {
 }
 fn decode_url(v: &str) -> String {
     v.trim().replace("\\/", "/").replace("&amp;", "&")
-}
-fn collect_set_cookies(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
-    let mut cookies = HashMap::new();
-    for header in headers.get_all(reqwest::header::SET_COOKIE).iter() {
-        if let Ok(value) = header.to_str()
-            && let Some((name, value)) = value.split(';').next().and_then(|v| v.split_once('='))
-        {
-            cookies.insert(name.trim().into(), value.trim().into());
-        }
-    }
-    cookies
-}
-fn render_cookies(cookies: &HashMap<String, String>) -> String {
-    let mut entries = cookies.iter().collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(right.0));
-    entries
-        .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 fn extract_jump_url(body: &str) -> Option<String> {
     let patterns = [
@@ -681,6 +532,15 @@ fn is_real_url(v: &str) -> bool {
 }
 fn normalize_kind(kind: &str, url: &str) -> CloudType {
     let kind = kind.trim().to_ascii_lowercase();
+    if let Ok(parsed) = Url::parse(url) {
+        let host = parsed.host_str().unwrap_or("");
+        if host == "pan.uc.cn" {
+            return CloudType::Uc;
+        }
+        if host == "123pan.cn" || host.ends_with(".123pan.cn") {
+            return CloudType::Pan123;
+        }
+    }
     match kind.as_str() {
         "夸克" | "夸克网盘" | "quark" => CloudType::Quark,
         "百度" | "百度网盘" | "baidu" => CloudType::Baidu,
