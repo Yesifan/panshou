@@ -25,6 +25,10 @@ scripts/           # 安装与卸载脚本
 
 Read [development doc](./docs/development.md) for a complete list of commands.
 
+## Specifications
+
+Before adding, editing, or implementing a spec, read the [spec index and maintenance rules](docs/specs/README.md) and follow them when maintaining specs and the index.
+
 ## Docs
 
 每次发布前更新 `docs/` 下的文档，确保文档与代码保持一致。
